@@ -4,8 +4,14 @@ if(!isset($_SESSION['user_id'])){
     header("Location: index.php");
     exit();
 }
+$conn = new mysqli(
+    $_ENV['MYSQLHOST'],
+    $_ENV['MYSQLUSER'],
+    $_ENV['MYSQLPASSWORD'],
+    $_ENV['MYSQLDATABASE'],
+    $_ENV['MYSQLPORT']
+);
 
-$conn = new mysqli("localhost","root","","trackwise");
 $uid = $_SESSION['user_id'];
 
 if(isset($_POST['update_profile'])){
