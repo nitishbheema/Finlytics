@@ -1,6 +1,12 @@
 <?php
 session_start();
-$conn = new mysqli("localhost","root","","trackwise");
+$conn = new mysqli(
+    $_ENV['MYSQLHOST'],
+    $_ENV['MYSQLUSER'],
+    $_ENV['MYSQLPASSWORD'],
+    $_ENV['MYSQLDATABASE'],
+    $_ENV['MYSQLPORT']
+);
 
 if(isset($_POST['email'])){
     $email = $_POST['email'];
