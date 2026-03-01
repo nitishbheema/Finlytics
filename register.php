@@ -2,7 +2,7 @@
 
 $host = "yamabiko.proxy.rlwy.net";
 $user = "root";
-$password = "YOUR_PASSWORD_HERE";
+$password = "FUVTxyveCjKHaUUpSElYSrzgWWPEyokT";
 $database = "railway";
 $port = 15951;
 
