@@ -5,11 +5,16 @@ $user = "root";
 $password = "FUVTxyveCjKHaUUpSElYSrzgWWPEyokT";
 $database = "railway";
 $port = 15951;
-
-$conn = new mysqli($host, $user, $password, $database, $port);
+$conn = new mysqli(
+    getenv("MYSQLHOST"),
+    getenv("MYSQLUSER"),
+    getenv("MYSQLPASSWORD"),
+    getenv("MYSQLDATABASE"),
+    getenv("MYSQLPORT")
+);
 
 if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
+    die("Database Connection Failed: " . $conn->connect_error);
 }
 if(isset($_POST['email'])){
     $email = $_POST['email'];
