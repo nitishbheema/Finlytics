@@ -135,8 +135,8 @@ Already have an account? <a href="index.php">Login</a>
 </div>
 
 </body>
-<<<<<<< HEAD
+
 </html>
-=======
+
 </html>
->>>>>>> 9b882ed74f9466c70673c856716a8dfa26f3f5c6
+
