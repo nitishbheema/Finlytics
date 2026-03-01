@@ -2,7 +2,13 @@
 session_start();
 require('fpdf/fpdf.php');
 
-$conn = new mysqli("localhost","root","","trackwise");
+$conn = new mysqli(
+    $_ENV['MYSQLHOST'],
+    $_ENV['MYSQLUSER'],
+    $_ENV['MYSQLPASSWORD'],
+    $_ENV['MYSQLDATABASE'],
+    $_ENV['MYSQLPORT']
+);
 $uid = $_SESSION['user_id'];
 
 $pdf = new FPDF();
