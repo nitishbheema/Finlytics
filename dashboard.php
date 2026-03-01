@@ -5,13 +5,17 @@ if(!isset($_SESSION['user_id'])){
     exit();
 }
 
-$conn = new mysqli(
-    $_ENV['MYSQLHOST'],
-    $_ENV['MYSQLUSER'],
-    $_ENV['MYSQLPASSWORD'],
-    $_ENV['MYSQLDATABASE'],
-    $_ENV['MYSQLPORT']
-);
+$host = "yamabiko.proxy.rlwy.net";
+$user = "root";
+$password = "YOUR_PASSWORD_HERE";
+$database = "railway";
+$port = 15951;
+
+$conn = new mysqli($host, $user, $password, $database, $port);
+
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
 $uid = $_SESSION['user_id'];
 
 $userData = $conn->query("SELECT name,budget,photo FROM users WHERE user_id=$uid")->fetch_assoc();
