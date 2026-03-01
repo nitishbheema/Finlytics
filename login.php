@@ -1,7 +1,26 @@
 <?php
 session_start();
+<<<<<<< HEAD
 $conn = new mysqli("localhost","root","","trackwise");
 
+=======
+$host = "yamabiko.proxy.rlwy.net";
+$user = "root";
+$password = "FUVTxyveCjKHaUUpSElYSrzgWWPEyokT";
+$database = "railway";
+$port = 15951;
+$conn = new mysqli(
+    getenv("MYSQLHOST"),
+    getenv("MYSQLUSER"),
+    getenv("MYSQLPASSWORD"),
+    getenv("MYSQLDATABASE"),
+    getenv("MYSQLPORT")
+);
+
+if ($conn->connect_error) {
+    die("Database Connection Failed: " . $conn->connect_error);
+}
+>>>>>>> 9b882ed74f9466c70673c856716a8dfa26f3f5c6
 if(isset($_POST['email'])){
     $email = $_POST['email'];
     $password = $_POST['password'];
@@ -25,4 +44,8 @@ if(isset($_POST['email'])){
         echo "User not found";
     }
 }
+<<<<<<< HEAD
 ?>
+=======
+?>
+>>>>>>> 9b882ed74f9466c70673c856716a8dfa26f3f5c6
