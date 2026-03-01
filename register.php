@@ -1,8 +1,6 @@
 <?php
-<<<<<<< HEAD
 $conn = new mysqli("localhost","root","","trackwise");
 
-=======
 
 $host = "yamabiko.proxy.rlwy.net";
 $user = "root";
@@ -21,7 +19,7 @@ $conn = new mysqli(
 if ($conn->connect_error) {
     die("Database Connection Failed: " . $conn->connect_error);
 }
->>>>>>> 9b882ed74f9466c70673c856716a8dfa26f3f5c6
+
 if(isset($_POST['name'])){
     $name = $_POST['name'];
     $email = $_POST['email'];
