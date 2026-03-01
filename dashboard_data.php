@@ -1,6 +1,12 @@
 <?php
 session_start();
-$conn = new mysqli("localhost","root","","trackwise");
+$conn = new mysqli(
+    $_ENV['MYSQLHOST'],
+    $_ENV['MYSQLUSER'],
+    $_ENV['MYSQLPASSWORD'],
+    $_ENV['MYSQLDATABASE'],
+    $_ENV['MYSQLPORT']
+);
 $uid = $_SESSION['user_id'];
 
 $userData = $conn->query("SELECT budget FROM users WHERE user_id=$uid")->fetch_assoc();
