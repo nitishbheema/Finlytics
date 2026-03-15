@@ -1,0 +1,336 @@
+/* ===== ROOT VARIABLES ===== */
+
+:root{
+--bg:#f4f6fb;
+--card:#ffffff;
+--text:#222;
+--primary:#1e3c72;
+}
+
+body.dark{
+--bg:#1e1e2f;
+--card:#2c2c3f;
+--text:#fff;
+--primary:#4e73df;
+}
+
+/* ===== BODY ===== */
+
+body{
+margin:0;
+padding:0;
+font-family:'Segoe UI', Arial, sans-serif;
+background:var(--bg);
+color:var(--text);
+transition:0.3s;
+}
+
+/* ===== SIDEBAR ===== */
+
+.sidebar{
+width:220px;
+height:100vh;
+background:var(--primary);
+color:white;
+position:fixed;
+padding:20px;
+}
+
+.sidebar a{
+display:block;
+color:white;
+text-decoration:none;
+margin:15px 0;
+transition:0.3s;
+}
+
+.sidebar a:hover{
+opacity:0.7;
+transform:translateX(5px);
+}
+
+/* ===== MAIN CONTENT ===== */
+
+.main{
+margin-left:240px;
+padding:30px;
+}
+
+/* ===== TOPBAR ===== */
+
+.topbar{
+display:flex;
+justify-content:space-between;
+align-items:center;
+margin-bottom:30px;
+}
+
+.header-right{
+display:flex;
+align-items:center;
+gap:20px;
+}
+
+.toggle{
+cursor:pointer;
+padding:8px 12px;
+background:var(--card);
+border-radius:20px;
+box-shadow:0 5px 15px rgba(0,0,0,0.1);
+}
+
+/* ===== NOTIFICATIONS ===== */
+
+.bell{
+position:relative;
+cursor:pointer;
+font-size:20px;
+}
+
+.notification-box{
+display:none;
+position:absolute;
+top:35px;
+right:0;
+background:var(--card);
+padding:18px;
+width:240px;
+border-radius:12px;
+box-shadow:0 12px 25px rgba(0,0,0,0.25);
+}
+
+.notification-box p{
+margin:6px 0;
+font-size:14px;
+}
+
+.bell:hover .notification-box{
+display:block;
+}
+
+/* ===== USER DROPDOWN ===== */
+
+.user-info{
+position:relative;
+cursor:pointer;
+}
+
+.user-info img{
+width:45px;
+height:45px;
+border-radius:50%;
+object-fit:cover;
+border:3px solid var(--primary);
+}
+
+.dropdown{
+display:none;
+position:absolute;
+right:0;
+top:55px;
+background:var(--card);
+padding:10px;
+border-radius:8px;
+box-shadow:0 10px 20px rgba(0,0,0,0.1);
+}
+
+.dropdown a{
+display:block;
+text-decoration:none;
+color:var(--text);
+padding:8px 12px;
+}
+
+.dropdown a:hover{
+background:#eee;
+}
+
+.user-info:hover .dropdown{
+display:block;
+}
+
+/* ===== CARDS ===== */
+
+.card-container{
+display:flex;
+gap:20px;
+margin-bottom:30px;
+flex-wrap:wrap;
+}
+
+.card{
+flex:1 1 200px;
+background:var(--card);
+padding:20px;
+border-radius:12px;
+box-shadow:0 10px 25px rgba(0,0,0,0.1);
+transition:0.3s;
+}
+
+.card:hover{
+transform:translateY(-5px);
+}
+
+.card h1{
+color:var(--primary);
+}
+
+/* ===== WARNING ===== */
+
+.warning{
+background:#ffdddd;
+padding:15px;
+border-radius:8px;
+margin-bottom:20px;
+}
+
+/* ===== CHART BOX ===== */
+
+.chart-box{
+background:var(--card);
+padding:20px;
+border-radius:12px;
+box-shadow:0 10px 25px rgba(0,0,0,0.1);
+margin-bottom:30px;
+}
+
+/* ===== INSIGHT ===== */
+
+.insight-box{
+background:var(--card);
+padding:20px;
+border-radius:12px;
+box-shadow:0 10px 25px rgba(0,0,0,0.1);
+margin-bottom:30px;
+}
+
+/* ===== PROGRESS BAR ===== */
+
+.progress{
+height:15px;
+background:#ddd;
+border-radius:10px;
+overflow:hidden;
+margin-top:10px;
+}
+
+.progress-bar{
+height:100%;
+background:var(--primary);
+transition:0.6s;
+}
+
+/* ===== EXTRA ROW ===== */
+
+.extra-row{
+display:flex;
+flex-wrap:wrap;
+gap:20px;
+margin-bottom:30px;
+}
+
+.extra-row .card{
+flex:1 1 300px;
+max-width:100%;
+}
+
+/* ===== SCORE ===== */
+
+.score{
+font-size:26px;
+font-weight:bold;
+}
+
+/* ===== TABLES ===== */
+
+.recent-table{
+width:100%;
+border-collapse:collapse;
+}
+
+.recent-table th,
+.recent-table td{
+padding:8px;
+text-align:center;
+}
+
+.recent-table th{
+background:var(--primary);
+color:white;
+}
+
+/* ===== GENERIC FORM STYLES (FROM OLD STYLE.CSS) ===== */
+
+.box{
+width:850px;
+margin:60px auto;
+background:#ffffff;
+padding:30px;
+border-radius:12px;
+box-shadow:0 15px 40px rgba(0,0,0,0.2);
+}
+
+h2{
+text-align:center;
+margin-bottom:25px;
+color:#1e3c72;
+}
+
+h3{
+margin-top:25px;
+color:#2a5298;
+}
+
+a{
+text-decoration:none;
+font-weight:600;
+color:#1e3c72;
+margin:0 10px;
+}
+
+a:hover{
+color:#2a5298;
+}
+
+input, select, button{
+width:100%;
+padding:10px;
+margin-top:12px;
+border-radius:6px;
+border:1px solid #ccc;
+font-size:14px;
+}
+
+button{
+background:#1e3c72;
+color:white;
+border:none;
+cursor:pointer;
+font-weight:bold;
+transition:0.3s;
+}
+
+button:hover{
+background:#2a5298;
+}
+
+table{
+width:100%;
+border-collapse:collapse;
+margin-top:15px;
+}
+
+th{
+background:#1e3c72;
+color:white;
+padding:10px;
+}
+
+td{
+padding:10px;
+border-bottom:1px solid #eee;
+}
+
+tr:hover{
+background:#f5f8ff;
+}
