@@ -3,6 +3,19 @@ import { api } from '../utils/api';
 import { Plus, Edit2, Trash2, X, Check, ArrowLeft } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
+const incomeIcons = {
+  Salary: '💼',
+  Freelance: '💻',
+  Investment: '📈',
+  Business: '🏢',
+  Rental: '🏠',
+  Dividends: '🪙',
+  Bonus: '🎁',
+  Interest: '🏦',
+  'Other Income': '💵',
+  Other: '💵',
+};
+
 export default function AddIncome() {
   const [incomes, setIncomes] = useState([]);
   const [categories, setCategories] = useState([]);
@@ -20,12 +33,12 @@ export default function AddIncome() {
 
   const fetchCategories = async () => {
     try {
-      const data = await api.get('/categories');
+      const data = await api.get('/categories?type=income');
       if (data.success) {
         setCategories(data.categories);
       }
     } catch (err) {
-      console.error('Failed to load categories', err);
+      console.error('Failed to load income categories', err);
     }
   };
 
@@ -157,7 +170,7 @@ export default function AddIncome() {
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
             <div>
               <label className="block text-xs font-medium text-[#a8a8a3] light:text-[#5a5a55] mb-1.5">
-                Category *
+                Income Category *
               </label>
               <select
                 required
@@ -165,20 +178,20 @@ export default function AddIncome() {
                 onChange={(e) => setCategoryId(e.target.value)}
                 className="w-full px-3 py-2.5 rounded-xl bg-[#1e1e21] light:bg-[#f0f0ee] border border-white/[0.07] light:border-black/[0.07] text-[#f2f2f0] light:text-[#1a1a18] text-xs focus:outline-none focus:border-brand"
               >
-                <option value="">Select Category</option>
+                <option value="">Select Income Category</option>
                 {categories.map((c) => (
                   <option key={c.category_id} value={c.category_id}>
-                    {c.category_name}
+                    {incomeIcons[c.category_name] || '💵'} {c.category_name}
                   </option>
                 ))}
-                <option value="custom">➕ Add New Category</option>
+                <option value="custom">➕ Add New Income Category</option>
               </select>
             </div>
 
             {categoryId === 'custom' && (
               <div className="col-span-1 sm:col-span-2">
                 <label className="block text-xs font-medium text-brand mb-1.5">
-                  New Category Name *
+                  New Income Category Name *
                 </label>
                 <input
                   type="text"
@@ -291,7 +304,8 @@ export default function AddIncome() {
                       {row.transaction_date}
                     </td>
                     <td className="py-3 px-3 font-medium text-[#f2f2f0] light:text-[#1a1a18]">
-                      {row.category_name}
+                      <span>{incomeIcons[row.category_name] || '💵'}</span>{' '}
+                      <span>{row.category_name}</span>
                     </td>
                     <td className="py-3 px-3 text-[#a8a8a3] light:text-[#5a5a55]">
                       {row.description || '—'}

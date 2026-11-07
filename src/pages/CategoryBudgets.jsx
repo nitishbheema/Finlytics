@@ -15,7 +15,7 @@ export default function CategoryBudgets() {
     try {
       setLoading(true);
       const [catsRes, budgetsRes] = await Promise.all([
-        api.get('/categories'),
+        api.get('/categories?type=expense'),
         api.get('/categories/budgets/overview'),
       ]);
 
@@ -59,7 +59,7 @@ export default function CategoryBudgets() {
             Category Budgets
           </h1>
           <p className="text-xs text-[#a8a8a3] light:text-[#5a5a55] mt-1">
-            Establish individual spending thresholds for each budget category
+            Establish individual spending thresholds for each expense category
           </p>
         </div>
         <Link
@@ -89,13 +89,13 @@ export default function CategoryBudgets() {
       {/* SET BUDGET FORM */}
       <div className="p-5 md:p-6 rounded-2xl bg-[#161618] light:bg-white border border-white/[0.07] light:border-black/[0.07] shadow-card">
         <h3 className="text-sm font-semibold text-[#f2f2f0] light:text-[#1a1a18] mb-4">
-          Set a Category Budget
+          Set an Expense Category Budget
         </h3>
 
         <form onSubmit={handleSaveBudget} className="flex flex-col sm:flex-row gap-4 items-end">
           <div className="w-full sm:flex-1">
             <label className="block text-xs font-medium text-[#a8a8a3] light:text-[#5a5a55] mb-1.5">
-              Select Category
+              Select Expense Category
             </label>
             <select
               required
@@ -103,7 +103,7 @@ export default function CategoryBudgets() {
               onChange={(e) => setSelectedCat(e.target.value)}
               className="w-full px-3 py-2.5 rounded-xl bg-[#1e1e21] light:bg-[#f0f0ee] border border-white/[0.07] light:border-black/[0.07] text-[#f2f2f0] light:text-[#1a1a18] text-xs focus:outline-none focus:border-brand"
             >
-              <option value="">Choose category...</option>
+              <option value="">Choose expense category...</option>
               {categories.map((c) => (
                 <option key={c.category_id} value={c.category_id}>
                   {c.category_name}
@@ -141,7 +141,7 @@ export default function CategoryBudgets() {
       {/* OVERVIEW TABLE */}
       <div className="p-5 md:p-6 rounded-2xl bg-[#161618] light:bg-white border border-white/[0.07] light:border-black/[0.07] shadow-card">
         <h3 className="text-sm font-semibold text-[#f2f2f0] light:text-[#1a1a18] mb-4">
-          Budget Overview
+          Expense Budget Overview
         </h3>
 
         <div className="overflow-x-auto">
@@ -233,7 +233,7 @@ export default function CategoryBudgets() {
               ) : (
                 <tr>
                   <td colSpan={6} className="py-8 text-center text-[#a8a8a3]">
-                    No categories found. Add categories to configure budgets.
+                    No expense categories found. Add categories to configure budgets.
                   </td>
                 </tr>
               )}

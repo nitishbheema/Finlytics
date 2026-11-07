@@ -13,6 +13,7 @@ const categoryIcons = {
   Utilities: '⚡',
   Education: '📚',
   Investment: '📈',
+  'Other Expense': '📁',
   Other: '📁',
 };
 
@@ -37,15 +38,15 @@ export default function AddExpense() {
   const [searchQuery, setSearchQuery] = useState('');
   const [page, setPage] = useState(1);
 
-  // Fetch categories
+  // Fetch only expense categories
   const fetchCategories = async () => {
     try {
-      const data = await api.get('/categories');
+      const data = await api.get('/categories?type=expense');
       if (data.success) {
         setCategories(data.categories);
       }
     } catch (err) {
-      console.error('Failed to load categories', err);
+      console.error('Failed to load expense categories', err);
     }
   };
 
@@ -192,7 +193,7 @@ export default function AddExpense() {
             {/* Category */}
             <div>
               <label className="block text-xs font-medium text-[#a8a8a3] light:text-[#5a5a55] mb-1.5">
-                Category *
+                Expense Category *
               </label>
               <select
                 required
@@ -200,13 +201,13 @@ export default function AddExpense() {
                 onChange={(e) => setCategoryId(e.target.value)}
                 className="w-full px-3 py-2.5 rounded-xl bg-[#1e1e21] light:bg-[#f0f0ee] border border-white/[0.07] light:border-black/[0.07] text-[#f2f2f0] light:text-[#1a1a18] text-xs focus:outline-none focus:border-brand"
               >
-                <option value="">Select Category</option>
+                <option value="">Select Expense Category</option>
                 {categories.map((c) => (
                   <option key={c.category_id} value={c.category_id}>
                     {categoryIcons[c.category_name] || '📁'} {c.category_name}
                   </option>
                 ))}
-                <option value="custom">➕ Add New Category</option>
+                <option value="custom">➕ Add New Expense Category</option>
               </select>
             </div>
 
@@ -214,7 +215,7 @@ export default function AddExpense() {
             {categoryId === 'custom' && (
               <div className="col-span-1 sm:col-span-2">
                 <label className="block text-xs font-medium text-brand mb-1.5">
-                  New Category Name *
+                  New Expense Category Name *
                 </label>
                 <input
                   type="text"
@@ -319,7 +320,7 @@ export default function AddExpense() {
             }}
             className="w-full px-3 py-2 rounded-xl bg-[#1e1e21] light:bg-[#f0f0ee] border border-white/[0.07] light:border-black/[0.07] text-[#f2f2f0] light:text-[#1a1a18] text-xs focus:outline-none focus:border-brand"
           >
-            <option value="">All Categories</option>
+            <option value="">All Expense Categories</option>
             {categories.map((c) => (
               <option key={c.category_id} value={c.category_name}>
                 {c.category_name}

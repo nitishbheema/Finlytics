@@ -32,10 +32,10 @@ This project was modernized from a legacy XAMPP/PHP/MySQL application into a mod
   - Algorithmic Financial Health Score (0-100) with dynamic status color.
   - Automated AI Financial Spending Insights.
   - Recent transactions table.
-- **Income Management**: Record earnings, salaries, and freelance retainers with inline custom category creation, editing, and deletion.
-- **Expense Management**: Log expenditures with category tags, custom amounts, dates, and descriptions. Paginated history with live category filters and description search.
-- **Category Budgets**: Configure custom spending thresholds per category with live usage tracking and alert badges (`Good`, `Near limit`, `Exceeded`, `No budget`).
-- **Category Management**: Create, rename inline, and delete categories with referential integrity protection against in-use transaction records.
+- **Income Management**: Record earnings with dedicated income categories (Salary, Freelance, Investment, Business, Rental, Dividends, Bonus) and inline custom income category creation, editing, and deletion.
+- **Expense Management**: Log expenditures with dedicated expense categories (Food, Travel, Shopping, Bills, etc.), custom amounts, dates, and descriptions. Paginated history with live category filters and description search.
+- **Category Budgets**: Configure custom spending thresholds per expense category with live usage tracking and alert badges (`Good`, `Near limit`, `Exceeded`, `No budget`).
+- **Category Management**: Create custom Income or Expense categories with strict type validation, filter categories by type, rename inline, and delete with referential integrity protection against in-use transaction records.
 - **Reports & PDF Export**: Instant generation and download of formatted, branded financial reports in PDF format.
 - **User Profile & Customization**: Manage name, monthly budget, instant base64 photo avatar upload/preview, and password modification with match validation.
 - **Dark & Light Mode**: Bespoke warm dark theme and crisp light theme with instant toggling and persistent local state.

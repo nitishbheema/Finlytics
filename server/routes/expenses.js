@@ -48,7 +48,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
     // Paginated expenses
     const listParams = [...params, limitNum, offset];
     const expensesRes = await query(
-      `SELECT e.expense_id, e.category_id, c.category_name, e.amount, e.expense_date, e.description, e.created_at
+      `SELECT e.expense_id, e.category_id, c.category_name, c.category_type, e.amount, e.expense_date, e.description, e.created_at
        FROM expenses e
        JOIN categories c ON e.category_id = c.category_id
        WHERE ${whereClause}
@@ -83,7 +83,7 @@ router.get('/export', authenticateToken, async (req, res, next) => {
     const uid = req.user.user_id;
 
     const result = await query(
-      `SELECT e.expense_id, e.category_id, c.category_name, e.amount, e.expense_date, e.description, e.created_at
+      `SELECT e.expense_id, e.category_id, c.category_name, c.category_type, e.amount, e.expense_date, e.description, e.created_at
        FROM expenses e
        JOIN categories c ON e.category_id = c.category_id
        WHERE e.user_id = $1
@@ -117,7 +117,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     const { id } = req.params;
 
     const result = await query(
-      `SELECT e.expense_id, e.category_id, c.category_name, e.amount, e.expense_date, e.description
+      `SELECT e.expense_id, e.category_id, c.category_name, c.category_type, e.amount, e.expense_date, e.description
        FROM expenses e
        JOIN categories c ON e.category_id = c.category_id
        WHERE e.expense_id = $1 AND e.user_id = $2`,
@@ -152,18 +152,33 @@ router.post('/', authenticateToken, async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Category and amount are required.' });
     }
 
-    // Support creating category on-the-fly if needed
+    // Support creating expense category on-the-fly
     if (category_id === 'custom' || (!category_id && custom_category)) {
       const catName = (custom_category || '').trim();
       if (!catName) {
         return res.status(400).json({ success: false, message: 'Please provide a valid category name.' });
       }
-      const existingCat = await query('SELECT category_id FROM categories WHERE LOWER(category_name) = LOWER($1)', [catName]);
+      const existingCat = await query(
+        'SELECT category_id, category_type FROM categories WHERE LOWER(category_name) = LOWER($1) AND category_type = $2',
+        [catName, 'expense']
+      );
       if (existingCat.rows.length > 0) {
         category_id = existingCat.rows[0].category_id;
       } else {
-        const insertCat = await query('INSERT INTO categories (category_name) VALUES ($1) RETURNING category_id', [catName]);
+        const insertCat = await query(
+          'INSERT INTO categories (category_name, category_type) VALUES ($1, $2) RETURNING category_id',
+          [catName, 'expense']
+        );
         category_id = insertCat.rows[0].category_id;
+      }
+    } else {
+      // Validate category exists and is an expense category
+      const catCheck = await query('SELECT category_id, category_type FROM categories WHERE category_id = $1', [category_id]);
+      if (catCheck.rows.length === 0) {
+        return res.status(400).json({ success: false, message: 'Selected category does not exist.' });
+      }
+      if (catCheck.rows[0].category_type !== 'expense') {
+        return res.status(400).json({ success: false, message: 'Expenses can only use expense categories.' });
       }
     }
 
@@ -200,12 +215,26 @@ router.put('/:id', authenticateToken, async (req, res, next) => {
 
     if (category_id === 'custom' || (!category_id && custom_category)) {
       const catName = (custom_category || '').trim();
-      const existingCat = await query('SELECT category_id FROM categories WHERE LOWER(category_name) = LOWER($1)', [catName]);
+      const existingCat = await query(
+        'SELECT category_id, category_type FROM categories WHERE LOWER(category_name) = LOWER($1) AND category_type = $2',
+        [catName, 'expense']
+      );
       if (existingCat.rows.length > 0) {
         category_id = existingCat.rows[0].category_id;
       } else {
-        const insertCat = await query('INSERT INTO categories (category_name) VALUES ($1) RETURNING category_id', [catName]);
+        const insertCat = await query(
+          'INSERT INTO categories (category_name, category_type) VALUES ($1, $2) RETURNING category_id',
+          [catName, 'expense']
+        );
         category_id = insertCat.rows[0].category_id;
+      }
+    } else {
+      const catCheck = await query('SELECT category_id, category_type FROM categories WHERE category_id = $1', [category_id]);
+      if (catCheck.rows.length === 0) {
+        return res.status(400).json({ success: false, message: 'Selected category does not exist.' });
+      }
+      if (catCheck.rows[0].category_type !== 'expense') {
+        return res.status(400).json({ success: false, message: 'Expenses can only use expense categories.' });
       }
     }
 

@@ -14,12 +14,17 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- 2. CATEGORIES TABLE
+-- 2. CATEGORIES TABLE (Separate Income and Expense Categories)
 CREATE TABLE IF NOT EXISTS categories (
     category_id SERIAL PRIMARY KEY,
-    category_name VARCHAR(100) NOT NULL UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    category_name VARCHAR(100) NOT NULL,
+    category_type VARCHAR(20) NOT NULL DEFAULT 'expense' CHECK (category_type IN ('income', 'expense')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_category_name_type UNIQUE (category_name, category_type)
 );
+
+-- Ensure category_type column exists for existing databases
+ALTER TABLE categories ADD COLUMN IF NOT EXISTS category_type VARCHAR(20) NOT NULL DEFAULT 'expense';
 
 -- 3. EXPENSES TABLE
 CREATE TABLE IF NOT EXISTS expenses (
@@ -56,6 +61,8 @@ CREATE TABLE IF NOT EXISTS category_budgets (
 -- ============================================================
 -- INDEXES FOR PERFORMANCE AND OPTIMIZED QUERIES
 -- ============================================================
+CREATE INDEX IF NOT EXISTS idx_categories_type ON categories(category_type);
+
 CREATE INDEX IF NOT EXISTS idx_expenses_user ON expenses(user_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date);
 CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category_id);

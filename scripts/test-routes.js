@@ -1,5 +1,6 @@
 import http from 'http';
 import app from '../server/app.js';
+import { generateToken } from '../server/middleware/auth.js';
 
 async function runRouteTests() {
   console.log('🧪 Starting HTTP Route Integration Tests...\n');
@@ -21,6 +22,12 @@ async function runRouteTests() {
       failed++;
     }
   }
+
+  const testToken = generateToken({ user_id: 1, email: 'test@finlytics.dev', name: 'Tester' });
+  const authHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${testToken}`,
+  };
 
   try {
     // 1. Health check
@@ -60,7 +67,22 @@ async function runRouteTests() {
     const profRes = await fetch(`${baseUrl}/api/user/profile`, { method: 'PUT' });
     assert(profRes.status === 401, 'PUT /api/user/profile rejects unauthenticated requests with 401');
 
-    // 5. 404 handler
+    // 5. Category Type Validation Tests (Invalid Type should return 400)
+    const badCatRes = await fetch(`${baseUrl}/api/categories`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ name: 'InvalidCat', type: 'crypto' }),
+    });
+    assert(badCatRes.status === 400, "POST /api/categories rejects invalid category types other than 'income' or 'expense'");
+
+    const emptyCatRes = await fetch(`${baseUrl}/api/categories`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ name: '', type: 'expense' }),
+    });
+    assert(emptyCatRes.status === 400, 'POST /api/categories rejects empty category name');
+
+    // 6. 404 handler
     const notFoundRes = await fetch(`${baseUrl}/api/nonexistent-route-12345`);
     assert(notFoundRes.status === 404, 'Unmatched /api/* route returns 404 Not Found');
 

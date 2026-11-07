@@ -10,7 +10,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
     const uid = req.user.user_id;
 
     const listRes = await query(
-      `SELECT t.transaction_id, t.category_id, c.category_name, t.amount, t.description, t.transaction_date, t.created_at
+      `SELECT t.transaction_id, t.category_id, c.category_name, c.category_type, t.amount, t.description, t.transaction_date, t.created_at
        FROM transactions t
        JOIN categories c ON t.category_id = c.category_id
        WHERE t.user_id = $1 AND t.type = 'income'
@@ -44,7 +44,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     const { id } = req.params;
 
     const result = await query(
-      `SELECT t.transaction_id, t.category_id, c.category_name, t.amount, t.description, t.transaction_date
+      `SELECT t.transaction_id, t.category_id, c.category_name, c.category_type, t.amount, t.description, t.transaction_date
        FROM transactions t
        JOIN categories c ON t.category_id = c.category_id
        WHERE t.transaction_id = $1 AND t.user_id = $2 AND t.type = 'income'`,
@@ -79,18 +79,33 @@ router.post('/', authenticateToken, async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Category and amount are required.' });
     }
 
-    // Support custom category creation on the fly
+    // Support creating income category on-the-fly
     if (category_id === 'custom' || (!category_id && custom_category)) {
       const catName = (custom_category || '').trim();
       if (!catName) {
         return res.status(400).json({ success: false, message: 'Please provide a valid category name.' });
       }
-      const existingCat = await query('SELECT category_id FROM categories WHERE LOWER(category_name) = LOWER($1)', [catName]);
+      const existingCat = await query(
+        'SELECT category_id, category_type FROM categories WHERE LOWER(category_name) = LOWER($1) AND category_type = $2',
+        [catName, 'income']
+      );
       if (existingCat.rows.length > 0) {
         category_id = existingCat.rows[0].category_id;
       } else {
-        const insertCat = await query('INSERT INTO categories (category_name) VALUES ($1) RETURNING category_id', [catName]);
+        const insertCat = await query(
+          'INSERT INTO categories (category_name, category_type) VALUES ($1, $2) RETURNING category_id',
+          [catName, 'income']
+        );
         category_id = insertCat.rows[0].category_id;
+      }
+    } else {
+      // Validate category exists and is an income category
+      const catCheck = await query('SELECT category_id, category_type FROM categories WHERE category_id = $1', [category_id]);
+      if (catCheck.rows.length === 0) {
+        return res.status(400).json({ success: false, message: 'Selected category does not exist.' });
+      }
+      if (catCheck.rows[0].category_type !== 'income') {
+        return res.status(400).json({ success: false, message: 'Income transactions can only use income categories.' });
       }
     }
 
@@ -127,12 +142,26 @@ router.put('/:id', authenticateToken, async (req, res, next) => {
 
     if (category_id === 'custom' || (!category_id && custom_category)) {
       const catName = (custom_category || '').trim();
-      const existingCat = await query('SELECT category_id FROM categories WHERE LOWER(category_name) = LOWER($1)', [catName]);
+      const existingCat = await query(
+        'SELECT category_id, category_type FROM categories WHERE LOWER(category_name) = LOWER($1) AND category_type = $2',
+        [catName, 'income']
+      );
       if (existingCat.rows.length > 0) {
         category_id = existingCat.rows[0].category_id;
       } else {
-        const insertCat = await query('INSERT INTO categories (category_name) VALUES ($1) RETURNING category_id', [catName]);
+        const insertCat = await query(
+          'INSERT INTO categories (category_name, category_type) VALUES ($1, $2) RETURNING category_id',
+          [catName, 'income']
+        );
         category_id = insertCat.rows[0].category_id;
+      }
+    } else {
+      const catCheck = await query('SELECT category_id, category_type FROM categories WHERE category_id = $1', [category_id]);
+      if (catCheck.rows.length === 0) {
+        return res.status(400).json({ success: false, message: 'Selected category does not exist.' });
+      }
+      if (catCheck.rows[0].category_type !== 'income') {
+        return res.status(400).json({ success: false, message: 'Income transactions can only use income categories.' });
       }
     }
 

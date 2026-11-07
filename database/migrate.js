@@ -31,6 +31,13 @@ async function runMigration() {
     await client.query(schemaSql);
     console.log('✅ Schema created successfully!');
 
+    // Update existing categories if necessary
+    await client.query(`
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS category_type VARCHAR(20) NOT NULL DEFAULT 'expense';
+      UPDATE categories SET category_type = 'income' WHERE LOWER(category_name) IN ('salary', 'freelance', 'investment', 'business', 'rental', 'dividends', 'bonus', 'other income');
+    `);
+    console.log('✅ Category types verified!');
+
     const seedSql = fs.readFileSync(path.join(__dirname, 'seed.sql'), 'utf-8');
     console.log('🌱 Executing seed.sql...');
     await client.query(seedSql);
