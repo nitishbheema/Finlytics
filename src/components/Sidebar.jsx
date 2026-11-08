@@ -9,6 +9,7 @@ import {
   PieChart, 
   FolderKanban, 
   FileText, 
+  Activity,
   UserCircle, 
   LogOut, 
   Sun, 
@@ -26,6 +27,7 @@ export default function Sidebar({ isOpen, onClose }) {
     { name: 'Category Budgets', to: '/category-budgets', icon: PieChart },
     { name: 'Manage Categories', to: '/categories', icon: FolderKanban },
     { name: 'Reports & Export', to: '/reports', icon: FileText },
+    { name: 'AutoTrack', to: '/autotrack', icon: Activity },
     { name: 'Profile', to: '/profile', icon: UserCircle },
   ];
 

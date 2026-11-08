@@ -12,6 +12,7 @@ import ManageCategories from './pages/ManageCategories';
 import Profile from './pages/Profile';
 import ChangePassword from './pages/ChangePassword';
 import Reports from './pages/Reports';
+import AutoTrack from './pages/AutoTrack';
 
 export default function App() {
   const [summaryData, setSummaryData] = useState(null);
@@ -41,6 +42,7 @@ export default function App() {
         <Route path="category-budgets" element={<CategoryBudgets />} />
         <Route path="categories" element={<ManageCategories />} />
         <Route path="reports" element={<Reports />} />
+        <Route path="autotrack" element={<AutoTrack />} />
         <Route path="profile" element={<Profile />} />
         <Route path="change-password" element={<ChangePassword />} />
       </Route>
