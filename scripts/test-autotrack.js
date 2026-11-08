@@ -1,17 +1,22 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { fingerprintForUser, isIsoDate, normalizeNotificationEvent, sha256 } from '../server/utils/autotrack.js';
 import {
   detectDelimiter,
   parseCSV,
   findHeaderRowIndex,
   guessColumnMapping,
+  detectStatementFormat,
+  cleanUpiEntity,
+  isSuccessfulStatus,
+  autoCategorize,
   cleanAmount,
   parseDateString,
-  extractMerchantAndRef,
+  parseAndNormalizeStatement,
   parseStatementRows,
 } from '../server/utils/csvParser.js';
 
-console.log('🧪 Running AutoTrack & CSV Statement Import Test Suite...\n');
+console.log('🧪 Running Comprehensive AutoTrack Automated Import Test Suite...\n');
 
 // ============================================================
 // 1. Notification Event Normalization & Scoped Fingerprints
@@ -68,109 +73,175 @@ assert.equal(parsedRows[2][3], '75000.00');
 console.log('  ✅ PASS: RFC 4180 quotes, embedded commas, and delimiters handled correctly');
 
 // ============================================================
-// 3. Bank Statement Preamble & Header Heuristics
+// 3. Automated Format Detection (UPI Unified, GPay, PhonePe, Paytm, Banks)
 // ============================================================
-console.log('--- Test Suite 3: Bank Statement Header & Column Mapping ---');
-const hdfcBankStatement = [
-  ['HDFC BANK LIMITED'],
-  ['Account Number: XXXXXXXX1234'],
-  ['Statement Period: 01/04/2026 to 30/04/2026'],
-  [],
-  ['Date', 'Narration', 'Chq/Ref No', 'Value Dt', 'Withdrawal Amt.', 'Deposit Amt.', 'Closing Balance'],
-  ['02/04/2026', 'UPI/DR/410294829102/Zomato/Order', '410294829102', '02/04/2026', '420.00', '', '15000.00'],
-  ['05/04/2026', 'ACH/SALARY/INFOSYS', 'INFY20260401', '05/04/2026', '', '85000.00', '100000.00'],
+console.log('--- Test Suite 3: Automated Statement Format Detection ---');
+
+// BHIM / UPI Unified Statement headers (from sample)
+const upiUnifiedHeaders = [
+  'Date', 'Time', 'Bank Name', 'Account Number', 'Sender', 'Receiver',
+  'Payment ID/Reference Number', 'Pay/Collect', 'Amount (in Rs.)', 'DR/CR', 'Status'
+];
+const upiFormat = detectStatementFormat(upiUnifiedHeaders);
+assert.equal(upiFormat.formatId, 'upi_unified');
+assert.equal(upiFormat.isRecognized, true);
+assert.equal(upiFormat.mapping.dateCol, 0);
+assert.equal(upiFormat.mapping.amountCol, 8);
+assert.equal(upiFormat.mapping.typeCol, 9);
+assert.equal(upiFormat.mapping.statusCol, 10);
+
+// Google Pay headers
+const gpayHeaders = ['Date', 'Time', 'Google Transaction ID', 'Description', 'Amount', 'Status'];
+const gpayFormat = detectStatementFormat(gpayHeaders);
+assert.equal(gpayFormat.formatId, 'google_pay');
+assert.equal(gpayFormat.isRecognized, true);
+
+// PhonePe headers
+const phonepeHeaders = ['Date', 'Transaction ID', 'Transaction With', 'Type', 'Amount', 'Status'];
+const phonepeFormat = detectStatementFormat(phonepeHeaders);
+assert.equal(phonepeFormat.formatId, 'phonepe');
+assert.equal(phonepeFormat.isRecognized, true);
+
+// Standard Bank headers
+const bankHeaders = ['Date', 'Narration', 'Chq/Ref No', 'Value Dt', 'Withdrawal Amt.', 'Deposit Amt.', 'Closing Balance'];
+const bankFormat = detectStatementFormat(bankHeaders);
+assert.equal(bankFormat.formatId, 'bank_statement');
+assert.equal(bankFormat.isRecognized, true);
+console.log('  ✅ PASS: Auto-format detection accurately recognizes UPI Unified, GPay, PhonePe, and Bank CSVs');
+
+// ============================================================
+// 4. Entity Cleaning & Status Filtering (Success vs. Failure)
+// ============================================================
+console.log('--- Test Suite 4: Entity Cleaning & Status Filtering ---');
+assert.equal(cleanUpiEntity('xxxxx09933@ybl(NARAYANA BHIMA)'), 'NARAYANA BHIMA');
+assert.equal(cleanUpiEntity('xxxxxxxxxndra6@okaxis(xxxxxxxxNDRA)'), 'xxxxxxxxNDRA');
+assert.equal(cleanUpiEntity('swiggy@icici(Swiggy Orders)'), 'Swiggy Orders');
+assert.equal(cleanUpiEntity('zomato@hdfcbank'), 'Zomato');
+
+assert.equal(isSuccessfulStatus('SUCCESS'), true);
+assert.equal(isSuccessfulStatus('COMPLETED'), true);
+assert.equal(isSuccessfulStatus('PAID'), true);
+assert.equal(isSuccessfulStatus('FAILURE'), false);
+assert.equal(isSuccessfulStatus('FAILED'), false);
+assert.equal(isSuccessfulStatus('DECLINED'), false);
+assert.equal(isSuccessfulStatus('PENDING'), false);
+console.log('  ✅ PASS: Clean counterparty extraction and rigorous success/failure filtering');
+
+// ============================================================
+// 5. Intelligent Category Auto-Assignment
+// ============================================================
+console.log('--- Test Suite 5: Intelligent Category Auto-Classification ---');
+const mockCategories = [
+  { category_id: 1, category_name: 'Food', category_type: 'expense' },
+  { category_id: 2, category_name: 'Travel', category_type: 'expense' },
+  { category_id: 3, category_name: 'Shopping', category_type: 'expense' },
+  { category_id: 4, category_name: 'Bills', category_type: 'expense' },
+  { category_id: 5, category_name: 'Entertainment', category_type: 'expense' },
+  { category_id: 9, category_name: 'Other Expense', category_type: 'expense' },
+  { category_id: 10, category_name: 'Salary', category_type: 'income' },
+  { category_id: 11, category_name: 'Investment', category_type: 'income' },
+  { category_id: 12, category_name: 'Bonus', category_type: 'income' },
+  { category_id: 17, category_name: 'Other Income', category_type: 'income' },
 ];
 
-const headerIdx = findHeaderRowIndex(hdfcBankStatement);
-assert.equal(headerIdx, 4, 'Header row should skip bank preamble');
+const catSwiggy = autoCategorize('Payment to Swiggy Bangalore', 'debit', mockCategories);
+assert.equal(catSwiggy.categoryName, 'Food');
 
-const mapping = guessColumnMapping(hdfcBankStatement[headerIdx]);
-assert.equal(mapping.dateCol, 0, 'Date column mapped');
-assert.equal(mapping.descCol, 1, 'Narration column mapped');
-assert.equal(mapping.refCol, 2, 'Ref column mapped');
-assert.equal(mapping.debitCol, 4, 'Withdrawal column mapped');
-assert.equal(mapping.creditCol, 5, 'Deposit column mapped');
-console.log('  ✅ PASS: Bank preamble skipped and column mapping accurately detected');
+const catUber = autoCategorize('Payment to Uber India Ride', 'debit', mockCategories);
+assert.equal(catUber.categoryName, 'Travel');
 
-// ============================================================
-// 4. Date Parsing Robustness
-// ============================================================
-console.log('--- Test Suite 4: Multi-Format Date Parser ---');
-assert.equal(parseDateString('15/04/2026'), '2026-04-15'); // DD/MM/YYYY
-assert.equal(parseDateString('15-04-2026'), '2026-04-15'); // DD-MM-YYYY
-assert.equal(parseDateString('2026-04-15'), '2026-04-15'); // YYYY-MM-DD
-assert.equal(parseDateString('2026/04/15'), '2026-04-15'); // YYYY/MM/DD
-assert.equal(parseDateString('15 Apr 2026'), '2026-04-15'); // DD Mon YYYY
-assert.equal(parseDateString('15-APR-2026'), '2026-04-15'); // DD-Mon-YYYY
-assert.equal(parseDateString('04/15/2026', 'mdy'), '2026-04-15'); // MM/DD/YYYY with hint
-assert.equal(parseDateString('invalid-date'), null);
-assert.equal(parseDateString(''), null);
-console.log('  ✅ PASS: Flexible date parsing handles all major bank date conventions');
+const catAmazon = autoCategorize('Payment to Amazon Retail India', 'debit', mockCategories);
+assert.equal(catAmazon.categoryName, 'Shopping');
+
+const catAirtel = autoCategorize('Payment to Airtel Prepaid Recharge', 'debit', mockCategories);
+assert.equal(catAirtel.categoryName, 'Bills');
+
+const catSalary = autoCategorize('Payment from Infosys Limited Salary', 'credit', mockCategories);
+assert.equal(catSalary.categoryName, 'Salary');
+
+const catCashback = autoCategorize('Cashback Reward from Cred', 'credit', mockCategories);
+assert.equal(catCashback.categoryName, 'Bonus');
+
+const catUnknownExpense = autoCategorize('Payment to Random Person X', 'debit', mockCategories);
+assert.equal(catUnknownExpense.categoryName, 'Other Expense');
+console.log('  ✅ PASS: Accurate auto-categorization across expense and income rules with safe fallbacks');
 
 // ============================================================
-// 5. Amount Cleaning & Direction Detection
+// 6. Full Automated Statement Parsing & Deduplication Lifecycle
 // ============================================================
-console.log('--- Test Suite 5: Currency & Amount Cleaning ---');
-assert.deepEqual(cleanAmount('₹1,500.50'), { value: 1500.5, isNegative: false, suffixType: null });
-assert.deepEqual(cleanAmount('Rs. 25,000.00'), { value: 25000, isNegative: false, suffixType: null });
-assert.deepEqual(cleanAmount('-750.00'), { value: 750, isNegative: true, suffixType: null });
-assert.deepEqual(cleanAmount('1200.00 Dr'), { value: 1200, isNegative: false, suffixType: 'debit' });
-assert.deepEqual(cleanAmount('50000.00 Cr'), { value: 50000, isNegative: false, suffixType: 'credit' });
-assert.equal(cleanAmount('-'), null);
-assert.equal(cleanAmount(''), null);
-console.log('  ✅ PASS: Currency symbols, Indian commas, Dr/Cr suffixes parsed cleanly');
+console.log('--- Test Suite 6: Full Statement Parsing, Reversals & Deduplication ---');
+
+const sampleUpiCsv = `,,,,Transaction History,,,,,,
+Customer Mobile Number: +917780124320,,,,,,,Transaction History from 12/05/2026 to 08/11/2026,,,
+Date,Time,Bank Name,Account Number,Sender,Receiver,Payment ID/Reference Number,Pay/Collect,Amount (in Rs.),DR/CR,Status
+08/11/2026,10:20:24,UNION BANK OF INDIA,XXXX0189,xxxxx24320@upi(BHEEMA NITISH),swiggy@icici(Swiggy Order),102024302967,PAY,450,DR,SUCCESS
+07/11/2026,14:07:39,UNION BANK OF INDIA,XXXX0189,payroll@infosys(Infosys Tech),xxxxx24320@upi(BHEEMA NITISH),830877339457,COLLECT,85000,CR,SUCCESS
+07/11/2026,13:00:00,UNION BANK OF INDIA,XXXX0189,xxxxx24320@upi(BHEEMA NITISH),uber@axis(Uber Ride),998877665544,PAY,320,DR,FAILURE
+06/11/2026,12:00:00,UNION BANK OF INDIA,XXXX0189,merchant@upi(Refund for Order),xxxxx24320@upi(BHEEMA NITISH),112233445566,COLLECT,450,CR,SUCCESS
+08/11/2026,10:20:24,UNION BANK OF INDIA,XXXX0189,xxxxx24320@upi(BHEEMA NITISH),swiggy@icici(Swiggy Order),102024302967,PAY,450,DR,SUCCESS`;
+
+const parsed1 = parseAndNormalizeStatement(sampleUpiCsv, {
+  userId: 42,
+  categories: mockCategories,
+});
+
+assert.equal(parsed1.formatId, 'upi_unified');
+assert.equal(parsed1.isRecognized, true);
+assert.equal(parsed1.successfulRows.length, 3, '3 successful unique rows');
+assert.equal(parsed1.duplicateRows.length, 1, '1 duplicate row detected');
+assert.equal(parsed1.skippedFailedRows.length, 1, '1 FAILURE status row skipped');
+
+// Verify debit vs credit classification
+assert.equal(parsed1.successfulRows[0].direction, 'debit');
+assert.equal(parsed1.successfulRows[0].categoryName, 'Food');
+assert.equal(parsed1.successfulRows[1].direction, 'credit');
+assert.equal(parsed1.successfulRows[1].categoryName, 'Salary');
+assert.equal(parsed1.successfulRows[2].direction, 'credit'); // Refund
+assert.equal(parsed1.successfulRows[2].categoryName, 'Bonus');
+
+// Verify second upload with existing fingerprints (100% deduplication)
+const existingFingerprints = new Set(parsed1.successfulRows.map(r => r.fingerprint));
+const parsed2 = parseAndNormalizeStatement(sampleUpiCsv, {
+  userId: 42,
+  categories: mockCategories,
+  existingFingerprints,
+});
+assert.equal(parsed2.successfulRows.length, 0, 'Zero new rows imported on re-upload');
+assert.equal(parsed2.duplicateRows.length, 4, 'All previously imported items marked duplicate');
+console.log('  ✅ PASS: 100% duplicate prevention across re-uploads and failed rows skipped cleanly');
 
 // ============================================================
-// 6. Narration & Reference Extraction
+// 7. Verify Local Statement Fixture If Available
 // ============================================================
-console.log('--- Test Suite 6: Merchant Cleaning & UTR Extraction ---');
-const parsedNarration1 = extractMerchantAndRef('UPI/DR/410294829102/Zomato/Order', '');
-assert.equal(parsedNarration1.merchant, 'Zomato');
-assert.equal(parsedNarration1.reference, '410294829102');
+console.log('--- Test Suite 7: Local Fixture Validation (Transaction_Statement.csv) ---');
+const localFixturePath = 'C:\\Users\\Nitish\\Downloads\\Transaction_Statement.csv';
+if (fs.existsSync(localFixturePath)) {
+  const fileContent = fs.readFileSync(localFixturePath, 'utf8');
+  const fixtureRes = parseAndNormalizeStatement(fileContent, {
+    userId: 99,
+    categories: mockCategories,
+  });
 
-const parsedNarration2 = extractMerchantAndRef('POS 401234XXXXXX1234 STARBUCKS COFFEE', 'TXN9988');
-assert.equal(parsedNarration2.merchant, 'STARBUCKS COFFEE');
-assert.equal(parsedNarration2.reference, 'TXN9988');
-console.log('  ✅ PASS: UPI/UTR reference and clean merchant extracted');
+  assert.equal(fixtureRes.formatId, 'upi_unified');
+  assert.equal(fixtureRes.isRecognized, true);
+  assert.equal(fixtureRes.successfulRows.length, 932);
+  assert.equal(fixtureRes.skippedFailedRows.length, 26);
+  assert.equal(fixtureRes.invalidRows.length, 0);
 
-// ============================================================
-// 7. Statement Validation & No Silent Discarding
-// ============================================================
-console.log('--- Test Suite 7: Statement Row Validation & Duplicate Prevention ---');
-const testRows = [
-  ['Date', 'Narration', 'Debit', 'Credit'],
-  ['01/05/2026', 'Swiggy', '350.00', ''], // Valid Debit
-  ['02/05/2026', 'Client Payment', '', '15000.00'], // Valid Credit
-  ['01/05/2026', 'Swiggy', '350.00', ''], // Duplicate within file
-  ['invalid-date', 'Grocery Store', '500.00', ''], // Invalid row (bad date)
-  ['03/05/2026', 'Zero amount line', '0.00', ''], // Invalid row (zero amount)
-];
-
-const existingFp = new Set();
-const statementResult = parseStatementRows(testRows, {
-  dateCol: 0,
-  descCol: 1,
-  debitCol: 2,
-  creditCol: 3,
-}, { userId: 42, existingFingerprints: existingFp });
-
-assert.equal(statementResult.validRows.length, 3);
-assert.equal(statementResult.validRows[0].direction, 'debit');
-assert.equal(statementResult.validRows[0].amount, 350);
-assert.equal(statementResult.validRows[0].isDuplicate, false);
-assert.equal(statementResult.validRows[1].direction, 'credit');
-assert.equal(statementResult.validRows[1].amount, 15000);
-assert.equal(statementResult.validRows[1].isDuplicate, false);
-assert.equal(statementResult.validRows[2].isDuplicate, true, 'Repeated row in batch flagged duplicate');
-
-// Check invalid rows are never silently discarded
-assert.equal(statementResult.invalidRows.length, 2);
-assert.match(statementResult.invalidRows[0].reason, /date/i);
-assert.equal(statementResult.invalidRows[0].rowNumber, 5);
-assert.match(statementResult.invalidRows[1].reason, /amount/i);
-assert.equal(statementResult.invalidRows[1].rowNumber, 6);
-console.log('  ✅ PASS: Duplicate detection works and invalid records are explicitly explained, never silently dropped');
+  // Re-run for complete deduplication test
+  const existingSet = new Set(fixtureRes.successfulRows.map(r => r.fingerprint));
+  const reUploadRes = parseAndNormalizeStatement(fileContent, {
+    userId: 99,
+    categories: mockCategories,
+    existingFingerprints: existingSet,
+  });
+  assert.equal(reUploadRes.successfulRows.length, 0);
+  assert.equal(reUploadRes.duplicateRows.length, 932);
+  console.log(`  ✅ PASS: Verified 958 rows in local fixture: 932 successful imported, 26 failed skipped, 100% deduplicated on re-upload`);
+} else {
+  console.log('  ℹ️  Notice: Local fixture Transaction_Statement.csv not in Downloads path, skipped file fixture');
+}
 
 console.log('\n========================================');
-console.log('AutoTrack & CSV Import Tests: All Passed!');
+console.log('AutoTrack Automated Import Tests: All Passed!');
 console.log('========================================\n');

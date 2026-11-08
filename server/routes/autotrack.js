@@ -9,16 +9,17 @@ import {
   parseCSV,
   findHeaderRowIndex,
   guessColumnMapping,
+  detectStatementFormat,
   parseStatementRows,
+  parseAndNormalizeStatement,
 } from '../utils/csvParser.js';
 
 const router = express.Router();
 const MAX_EVENTS_PER_BATCH = 25;
-const MAX_CSV_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_CSV_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-// Parse json body up to 5MB for CSV statements
-router.use(express.json({ limit: '5mb' }));
+router.use(express.json({ limit: '10mb' }));
 
 /**
  * Helper to ensure a deterministic Web Statement device exists for the user
@@ -44,7 +45,6 @@ async function getOrCreateWebDevice(client, userId) {
     );
     return deviceId;
   } catch (err) {
-    // If table doesn't require device or has issues, return null
     return null;
   }
 }
@@ -55,18 +55,17 @@ async function getOrCreateWebDevice(client, userId) {
 async function findFallbackCategory(client, type) {
   const preferred = type === 'expense' ? 'other expense' : 'other income';
   const result = await client.query(
-    `SELECT category_id FROM public.categories
+    `SELECT category_id, category_name FROM public.categories
       WHERE category_type = $1
       ORDER BY CASE WHEN LOWER(category_name) = $2 THEN 0 ELSE 1 END, category_id
       LIMIT 1`,
     [type, preferred]
   );
-  return result.rows[0]?.category_id ?? null;
+  return result.rows[0] || null;
 }
 
 /**
- * Imports an event into core Finlytics transaction tables (expenses or transactions),
- * validating category matching, checking fingerprint uniqueness, and updating import ledger.
+ * Helper to insert single event into core tables
  */
 async function importEvent(client, event, userId, categoryId = null, source = 'csv') {
   const type = event.direction === 'debit' ? 'expense' : 'income';
@@ -78,13 +77,13 @@ async function importEvent(client, event, userId, categoryId = null, source = 'c
     );
     if (category.rowCount === 0) throw new Error(`Choose a valid ${type} category.`);
   } else {
-    targetCategoryId = await findFallbackCategory(client, type);
+    const fallback = await findFallbackCategory(client, type);
+    targetCategoryId = fallback?.category_id;
   }
   if (!targetCategoryId) throw new Error(`No ${type} category is configured.`);
 
   const fingerprint = event.fingerprint;
 
-  // Insert fingerprint into ledger
   let claim;
   try {
     claim = await client.query(
@@ -95,7 +94,6 @@ async function importEvent(client, event, userId, categoryId = null, source = 'c
       [userId, fingerprint, source, type]
     );
   } catch (err) {
-    // Fallback if table doesn't exist yet
     claim = { rowCount: 1, rows: [{ import_id: null }] };
   }
 
@@ -106,7 +104,7 @@ async function importEvent(client, event, userId, categoryId = null, source = 'c
     inserted = await client.query(
       `INSERT INTO public.expenses (user_id, category_id, amount, expense_date, description)
        VALUES ($1, $2, $3, $4, $5) RETURNING expense_id`,
-      [userId, targetCategoryId, event.amount, event.transaction_date, event.merchant]
+      [userId, targetCategoryId, event.amount, event.transaction_date, event.description || event.merchant]
     );
     if (claim.rows[0]?.import_id) {
       await client.query('UPDATE public.transaction_import_fingerprints SET record_id = $1 WHERE import_id = $2', [
@@ -120,7 +118,7 @@ async function importEvent(client, event, userId, categoryId = null, source = 'c
   inserted = await client.query(
     `INSERT INTO public.transactions (user_id, category_id, amount, type, description, transaction_date)
      VALUES ($1, $2, $3, 'income', $4, $5) RETURNING transaction_id`,
-    [userId, targetCategoryId, event.amount, event.merchant, event.transaction_date]
+    [userId, targetCategoryId, event.amount, event.description || event.merchant, event.transaction_date]
   );
   if (claim.rows[0]?.import_id) {
     await client.query('UPDATE public.transaction_import_fingerprints SET record_id = $1 WHERE import_id = $2', [
@@ -132,13 +130,205 @@ async function importEvent(client, event, userId, categoryId = null, source = 'c
 }
 
 /* ==========================================================================
-   WEB CSV BANK STATEMENT ENDPOINTS
+   FULLY AUTOMATED CSV-BASED IMPORT ENDPOINT (ONE-CLICK)
    ========================================================================== */
 
-/**
- * Inspect uploaded CSV statement text:
- * Detects delimiter, finds header row, and suggests column mapping.
- */
+router.post('/csv/auto-import', authenticateToken, async (req, res, next) => {
+  const userId = Number(req.user.user_id);
+  const csvText = typeof req.body?.csvText === 'string' ? req.body.csvText : '';
+  const customMapping = req.body?.mapping || null;
+
+  if (!csvText.trim()) {
+    return res.status(400).json({ success: false, message: 'No CSV content provided.' });
+  }
+  if (Buffer.byteLength(csvText, 'utf8') > MAX_CSV_SIZE_BYTES) {
+    return res.status(413).json({ success: false, message: 'CSV statement file exceeds 10MB limit.' });
+  }
+
+  try {
+    // 1. Fetch user's categories from database
+    const catResult = await query(
+      `SELECT category_id, category_name, category_type FROM public.categories ORDER BY category_id ASC`
+    );
+    const dbCategories = catResult.rows;
+
+    // 2. Fetch existing fingerprints for deduplication
+    const existingFingerprints = new Set();
+    try {
+      const [claimedFp, eventFp] = await Promise.all([
+        query('SELECT fingerprint FROM public.transaction_import_fingerprints WHERE user_id = $1', [userId]),
+        query("SELECT fingerprint FROM public.autotrack_events WHERE user_id = $1 AND status != 'rejected'", [userId]),
+      ]);
+      claimedFp.rows.forEach(r => existingFingerprints.add(r.fingerprint));
+      eventFp.rows.forEach(r => existingFingerprints.add(r.fingerprint));
+    } catch (e) {}
+
+    // 3. Parse and normalize statement
+    const parsedStatement = parseAndNormalizeStatement(csvText, {
+      userId,
+      categories: dbCategories,
+      existingFingerprints,
+      customMapping,
+    });
+
+    // If format is completely unrecognized and no custom mapping was provided, prompt user for mapping
+    if (!parsedStatement.isRecognized && !customMapping) {
+      return res.json({
+        success: true,
+        isRecognized: false,
+        formatName: parsedStatement.formatName,
+        headers: parsedStatement.headers,
+        suggestedMapping: parsedStatement.mapping,
+        totalRawRows: parsedStatement.totalRows,
+        message: 'Unsupported or custom CSV format detected. Please confirm column mapping.',
+      });
+    }
+
+    // 4. Batch Import Eligible Transactions in a single atomic DB transaction
+    const client = await pool.connect();
+    const webDeviceId = await getOrCreateWebDevice(client, userId);
+
+    let importedExpensesCount = 0;
+    let importedIncomeCount = 0;
+    let totalExpenseAmount = 0;
+    let totalIncomeAmount = 0;
+    const categoryCounts = {};
+
+    try {
+      await client.query('BEGIN');
+
+      // Process successful non-duplicate rows
+      for (const item of parsedStatement.successfulRows) {
+        const isDebit = item.direction === 'debit';
+        const type = isDebit ? 'expense' : 'income';
+
+        // Safe category assignment
+        let catId = item.categoryId;
+        if (!catId) {
+          const fallback = await findFallbackCategory(client, type);
+          catId = fallback?.category_id;
+        }
+
+        // Insert into core financial tables
+        let insertedRecordId = null;
+        if (isDebit) {
+          const insRes = await client.query(
+            `INSERT INTO public.expenses (user_id, category_id, amount, expense_date, description)
+             VALUES ($1, $2, $3, $4, $5) RETURNING expense_id`,
+            [userId, catId, item.amount, item.transactionDate, item.description]
+          );
+          insertedRecordId = insRes.rows[0].expense_id;
+          importedExpensesCount++;
+          totalExpenseAmount += item.amount;
+        } else {
+          const insRes = await client.query(
+            `INSERT INTO public.transactions (user_id, category_id, amount, type, description, transaction_date)
+             VALUES ($1, $2, $3, 'income', $4, $5) RETURNING transaction_id`,
+            [userId, catId, item.amount, item.description, item.transactionDate]
+          );
+          insertedRecordId = insRes.rows[0].transaction_id;
+          importedIncomeCount++;
+          totalIncomeAmount += item.amount;
+        }
+
+        // Track category stats
+        categoryCounts[item.categoryName] = (categoryCounts[item.categoryName] || 0) + 1;
+
+        // Record fingerprint claim
+        try {
+          await client.query(
+            `INSERT INTO public.transaction_import_fingerprints (user_id, fingerprint, source, transaction_type, record_id)
+             VALUES ($1, $2, 'csv', $3, $4)
+             ON CONFLICT (user_id, fingerprint) DO NOTHING`,
+            [userId, item.fingerprint, type, insertedRecordId]
+          );
+        } catch (e) {}
+
+        // Record in autotrack_events ledger
+        try {
+          await client.query(
+            `INSERT INTO public.autotrack_events
+              (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, imported_into, record_id, review_note)
+             VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'approved', $9, $10, $11)
+             ON CONFLICT (user_id, fingerprint) DO NOTHING`,
+            [
+              userId,
+              webDeviceId,
+              item.fingerprint,
+              item.amount,
+              item.direction,
+              item.transactionDate,
+              item.merchant,
+              item.reference,
+              type,
+              insertedRecordId,
+              `Imported automatically from ${parsedStatement.formatName}`
+            ]
+          );
+        } catch (e) {}
+      }
+
+      // Record duplicate rows in autotrack ledger for visibility
+      for (const dup of parsedStatement.duplicateRows) {
+        try {
+          await client.query(
+            `INSERT INTO public.autotrack_events
+              (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, review_note)
+             VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'duplicate', 'Duplicate skipped: already present in records.')
+             ON CONFLICT (user_id, fingerprint) DO NOTHING`,
+            [userId, webDeviceId, dup.fingerprint, dup.amount, dup.direction, dup.transactionDate, dup.merchant, dup.reference]
+          );
+        } catch (e) {}
+      }
+
+      // Record skipped failed status rows (e.g. status was FAILURE)
+      for (const failedItem of parsedStatement.skippedFailedRows) {
+        try {
+          const fakeFp = sha256(`failed|${userId}|${rowNumber}|${Date.now()}|${Math.random()}`);
+          await client.query(
+            `INSERT INTO public.autotrack_events
+              (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, review_note)
+             VALUES ($1, $2, 'csv_statement', $3, 0, 'INR', 'debit', CURRENT_DATE, 'Failed Transaction', null, 'rejected', $4)
+             ON CONFLICT DO NOTHING`,
+            [userId, webDeviceId, fakeFp, failedItem.reason]
+          );
+        } catch (e) {}
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({
+      success: true,
+      isRecognized: true,
+      formatDetected: parsedStatement.formatName,
+      totalRows: parsedStatement.totalRows,
+      importedCount: parsedStatement.successfulRows.length,
+      duplicateCount: parsedStatement.duplicateRows.length,
+      failedCount: parsedStatement.skippedFailedRows.length,
+      invalidCount: parsedStatement.invalidRows.length,
+      importedExpensesCount,
+      importedIncomeCount,
+      totalExpenseAmount: parseFloat(totalExpenseAmount.toFixed(2)),
+      totalIncomeAmount: parseFloat(totalIncomeAmount.toFixed(2)),
+      categoryBreakdown: categoryCounts,
+      sampleImported: parsedStatement.successfulRows.slice(0, 5),
+      message: `Successfully processed statement! Imported ${parsedStatement.successfulRows.length} transactions (${parsedStatement.duplicateRows.length} duplicates and ${parsedStatement.skippedFailedRows.length} non-successful entries skipped).`,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/* ==========================================================================
+   LEGACY & MANUAL MAPPING ENDPOINTS (RETAINED FOR CUSTOM/EDGE CASES)
+   ========================================================================== */
+
 router.post('/csv/inspect', authenticateToken, async (req, res, next) => {
   try {
     const csvText = typeof req.body?.csvText === 'string' ? req.body.csvText : '';
@@ -146,7 +336,7 @@ router.post('/csv/inspect', authenticateToken, async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'No CSV content provided.' });
     }
     if (Buffer.byteLength(csvText, 'utf8') > MAX_CSV_SIZE_BYTES) {
-      return res.status(413).json({ success: false, message: 'CSV statement file exceeds 5MB limit.' });
+      return res.status(413).json({ success: false, message: 'CSV statement file exceeds 10MB limit.' });
     }
 
     const delimiter = detectDelimiter(csvText);
@@ -157,9 +347,7 @@ router.post('/csv/inspect', authenticateToken, async (req, res, next) => {
 
     const headerIdx = findHeaderRowIndex(rows);
     const headers = rows[headerIdx] || [];
-    const suggestedMapping = guessColumnMapping(headers);
-
-    // Provide up to 5 sample data rows for user preview
+    const formatInfo = detectStatementFormat(headers);
     const sampleRows = rows.slice(headerIdx + 1, headerIdx + 6);
 
     res.json({
@@ -167,7 +355,9 @@ router.post('/csv/inspect', authenticateToken, async (req, res, next) => {
       delimiter,
       headerRowIndex: headerIdx,
       headers,
-      suggestedMapping,
+      formatDetected: formatInfo.formatName,
+      isRecognized: formatInfo.isRecognized,
+      suggestedMapping: formatInfo.mapping,
       sampleRows,
       totalRawRows: rows.length,
     });
@@ -176,9 +366,6 @@ router.post('/csv/inspect', authenticateToken, async (req, res, next) => {
   }
 });
 
-/**
- * Preview and validate parsed statement transactions with duplicate checking
- */
 router.post('/csv/preview', authenticateToken, async (req, res, next) => {
   try {
     const userId = Number(req.user.user_id);
@@ -188,17 +375,10 @@ router.post('/csv/preview', authenticateToken, async (req, res, next) => {
     if (!csvText.trim()) {
       return res.status(400).json({ success: false, message: 'No CSV content provided.' });
     }
-    if (Buffer.byteLength(csvText, 'utf8') > MAX_CSV_SIZE_BYTES) {
-      return res.status(413).json({ success: false, message: 'CSV file is too large (max 5MB).' });
-    }
 
-    const delimiter = detectDelimiter(csvText);
-    const rows = parseCSV(csvText, delimiter);
-    if (rows.length === 0) {
-      return res.status(400).json({ success: false, message: 'CSV has no data.' });
-    }
+    const catResult = await query(`SELECT category_id, category_name, category_type FROM public.categories`);
+    const dbCategories = catResult.rows;
 
-    // Collect all existing fingerprints for user from both tables
     const existingFingerprints = new Set();
     try {
       const [claimedFp, eventFp] = await Promise.all([
@@ -207,28 +387,29 @@ router.post('/csv/preview', authenticateToken, async (req, res, next) => {
       ]);
       claimedFp.rows.forEach(r => existingFingerprints.add(r.fingerprint));
       eventFp.rows.forEach(r => existingFingerprints.add(r.fingerprint));
-    } catch (err) {
-      // Table might be fresh
-    }
+    } catch (err) {}
 
-    const parseResult = parseStatementRows(rows, customMapping, {
+    const parseResult = parseAndNormalizeStatement(csvText, {
       userId,
+      categories: dbCategories,
       existingFingerprints,
+      customMapping,
     });
-
-    const duplicateCount = parseResult.validRows.filter(r => r.isDuplicate).length;
-    const newCount = parseResult.validRows.filter(r => !r.isDuplicate).length;
 
     res.json({
       success: true,
       headers: parseResult.headers,
       mapping: parseResult.mapping,
-      totalRowsProcessed: rows.length,
-      validCount: parseResult.validRows.length,
-      newCount,
-      duplicateCount,
+      formatName: parseResult.formatName,
+      isRecognized: parseResult.isRecognized,
+      totalRowsProcessed: parseResult.totalRows,
+      validCount: parseResult.successfulRows.length,
+      duplicateCount: parseResult.duplicateRows.length,
+      failedCount: parseResult.skippedFailedRows.length,
       invalidCount: parseResult.invalidRows.length,
-      validRows: parseResult.validRows,
+      validRows: parseResult.successfulRows,
+      duplicateRows: parseResult.duplicateRows,
+      failedRows: parseResult.skippedFailedRows,
       invalidRows: parseResult.invalidRows,
     });
   } catch (error) {
@@ -236,10 +417,6 @@ router.post('/csv/preview', authenticateToken, async (req, res, next) => {
   }
 });
 
-/**
- * Import statement transactions:
- * Supports importing directly into expenses/income or placing into AutoTrack Review Queue.
- */
 router.post('/csv/import', authenticateToken, async (req, res, next) => {
   const userId = Number(req.user.user_id);
   const transactions = req.body?.transactions;
@@ -250,18 +427,9 @@ router.post('/csv/import', authenticateToken, async (req, res, next) => {
   if (!Array.isArray(transactions) || transactions.length === 0) {
     return res.status(400).json({ success: false, message: 'No transactions to import.' });
   }
-  if (transactions.length > 1000) {
-    return res.status(400).json({ success: false, message: 'Maximum 1,000 transactions per batch.' });
-  }
 
   const client = await pool.connect();
-  const summary = {
-    total: transactions.length,
-    queued: 0,
-    imported: 0,
-    duplicates: 0,
-    failed: 0,
-  };
+  const summary = { total: transactions.length, queued: 0, imported: 0, duplicates: 0, failed: 0 };
 
   try {
     await client.query('BEGIN');
@@ -275,7 +443,6 @@ router.post('/csv/import', authenticateToken, async (req, res, next) => {
 
       const fingerprint = item.fingerprint || sha256(`${userId}|${item.transactionDate}|${Number(item.amount).toFixed(2)}|${item.direction}|${item.reference || item.merchant?.toLowerCase()}`);
 
-      // Check if already exists in fingerprints
       let isDuplicate = false;
       try {
         const check = await client.query(
@@ -285,41 +452,21 @@ router.post('/csv/import', authenticateToken, async (req, res, next) => {
         if (check.rowCount > 0) isDuplicate = true;
       } catch (e) {}
 
-      if (!isDuplicate) {
-        const checkEvent = await client.query(
-          `SELECT event_id, status FROM public.autotrack_events WHERE user_id = $1 AND fingerprint = $2`,
-          [userId, fingerprint]
-        );
-        if (checkEvent.rowCount > 0 && checkEvent.rows[0].status !== 'rejected') {
-          isDuplicate = true;
-        }
-      }
-
       if (isDuplicate) {
         summary.duplicates++;
-        // Record in events ledger as duplicate if not already present
-        try {
-          await client.query(
-            `INSERT INTO public.autotrack_events
-              (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, review_note)
-             VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'duplicate', 'Already exists in your transaction records.')
-             ON CONFLICT (user_id, fingerprint) DO NOTHING`,
-            [userId, webDeviceId, fingerprint, item.amount, item.direction, item.transactionDate, item.merchant || 'Bank Transaction', item.reference || null]
-          );
-        } catch (err) {}
         continue;
       }
 
-      // If Direct Mode: immediately insert into expenses or transactions
       if (importMode === 'direct') {
-        const categoryId = item.direction === 'debit' ? defaultExpenseCategoryId : defaultIncomeCategoryId;
+        const categoryId = item.categoryId || (item.direction === 'debit' ? defaultExpenseCategoryId : defaultIncomeCategoryId);
         const result = await importEvent(
           client,
           {
             direction: item.direction,
             amount: Number(item.amount),
             transaction_date: item.transactionDate,
-            merchant: item.merchant || 'Bank Transaction',
+            merchant: item.merchant,
+            description: item.description,
             fingerprint,
           },
           userId,
@@ -330,33 +477,30 @@ router.post('/csv/import', authenticateToken, async (req, res, next) => {
         if (result.duplicate) {
           summary.duplicates++;
         } else {
-          // Record approved event in autotrack_events for tracking and audit
-          await client.query(
-            `INSERT INTO public.autotrack_events
-              (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, imported_into, record_id, review_note)
-             VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'approved', $9, $10, 'Imported directly from bank statement CSV.')
-             ON CONFLICT (user_id, fingerprint) DO UPDATE
-               SET status = 'approved', imported_into = EXCLUDED.imported_into, record_id = EXCLUDED.record_id, review_note = EXCLUDED.review_note`,
-            [userId, webDeviceId, fingerprint, item.amount, item.direction, item.transactionDate, item.merchant || 'Bank Transaction', item.reference || null, result.type, result.recordId]
-          );
           summary.imported++;
+          try {
+            await client.query(
+              `INSERT INTO public.autotrack_events
+                (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, imported_into, record_id, review_note)
+               VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'approved', $9, $10, 'Imported from CSV statement.')
+               ON CONFLICT (user_id, fingerprint) DO UPDATE
+                 SET status = 'approved', imported_into = EXCLUDED.imported_into, record_id = EXCLUDED.record_id`,
+              [userId, webDeviceId, fingerprint, item.amount, item.direction, item.transactionDate, item.merchant, item.reference, result.type, result.recordId]
+            );
+          } catch (e) {}
         }
       } else {
-        // Review Queue Mode: insert as pending into autotrack_events
         const inserted = await client.query(
           `INSERT INTO public.autotrack_events
             (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status)
            VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'pending')
            ON CONFLICT (user_id, fingerprint) DO NOTHING
            RETURNING event_id`,
-          [userId, webDeviceId, fingerprint, item.amount, item.direction, item.transactionDate, item.merchant || 'Bank Transaction', item.reference || null]
+          [userId, webDeviceId, fingerprint, item.amount, item.direction, item.transactionDate, item.merchant, item.reference]
         );
 
-        if (inserted.rowCount > 0) {
-          summary.queued++;
-        } else {
-          summary.duplicates++;
-        }
+        if (inserted.rowCount > 0) summary.queued++;
+        else summary.duplicates++;
       }
     }
 
@@ -366,8 +510,8 @@ router.post('/csv/import', authenticateToken, async (req, res, next) => {
       importMode,
       ...summary,
       message: importMode === 'direct'
-        ? `Successfully imported ${summary.imported} transactions into your records (${summary.duplicates} duplicates skipped).`
-        : `Added ${summary.queued} transactions to your AutoTrack review queue (${summary.duplicates} duplicates skipped).`,
+        ? `Imported ${summary.imported} transactions into records (${summary.duplicates} duplicates skipped).`
+        : `Added ${summary.queued} transactions to AutoTrack review queue (${summary.duplicates} duplicates skipped).`,
     });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
@@ -378,7 +522,7 @@ router.post('/csv/import', authenticateToken, async (req, res, next) => {
 });
 
 /* ==========================================================================
-   AUTOTRACK SUMMARY & OVERVIEW
+   SUMMARY & TRANSACTION HISTORY ENDPOINTS
    ========================================================================== */
 
 router.get('/summary', authenticateToken, async (req, res, next) => {
@@ -403,16 +547,14 @@ router.get('/summary', authenticateToken, async (req, res, next) => {
            FROM public.autotrack_events
           WHERE user_id = $1
           ORDER BY created_at DESC
-          LIMIT 5`,
+          LIMIT 10`,
         [userId]
       ),
     ]);
 
     const counts = { pending: 0, approved: 0, rejected: 0, duplicate: 0 };
     countsRes.rows.forEach((r) => {
-      if (counts[r.status] !== undefined) {
-        counts[r.status] = parseInt(r.count, 10);
-      }
+      if (counts[r.status] !== undefined) counts[r.status] = parseInt(r.count, 10);
     });
 
     res.json({
@@ -430,10 +572,6 @@ router.get('/summary', authenticateToken, async (req, res, next) => {
     next(error);
   }
 });
-
-/* ==========================================================================
-   REVIEW QUEUE & SINGLE / BULK ACTIONS
-   ========================================================================== */
 
 router.get('/events', authenticateToken, async (req, res, next) => {
   try {
@@ -453,7 +591,7 @@ router.get('/events', authenticateToken, async (req, res, next) => {
       queryText += ` AND status = $2`;
     }
 
-    queryText += ` ORDER BY transaction_date DESC, created_at DESC LIMIT 200`;
+    queryText += ` ORDER BY transaction_date DESC, created_at DESC LIMIT 300`;
 
     const result = await query(queryText, params);
     res.json({ success: true, events: result.rows });
@@ -494,7 +632,7 @@ router.post('/events/:eventId/approve', authenticateToken, async (req, res, next
       },
       Number(req.user.user_id),
       categoryId,
-      event.source_app?.includes('csv') ? 'csv' : 'android_notification'
+      'csv'
     );
 
     if (imported.duplicate) {
@@ -503,7 +641,7 @@ router.post('/events/:eventId/approve', authenticateToken, async (req, res, next
         [event.event_id]
       );
       await client.query('COMMIT');
-      return res.json({ success: true, duplicate: true, message: 'Marked as duplicate; already exists in records.' });
+      return res.json({ success: true, duplicate: true, message: 'Duplicate detected.' });
     }
 
     await client.query(
@@ -538,9 +676,6 @@ router.post('/events/:eventId/reject', authenticateToken, async (req, res, next)
   }
 });
 
-/**
- * Bulk approve pending events
- */
 router.post('/events/bulk-approve', authenticateToken, async (req, res, next) => {
   const userId = Number(req.user.user_id);
   const eventIds = req.body?.eventIds;
@@ -585,8 +720,8 @@ router.post('/events/bulk-approve', authenticateToken, async (req, res, next) =>
           fingerprint: event.fingerprint,
         },
         userId,
-        null, // Uses default fallback category
-        event.source_app?.includes('csv') ? 'csv' : 'android_notification'
+        null,
+        'csv'
       );
 
       if (imported.duplicate) {
@@ -609,7 +744,7 @@ router.post('/events/bulk-approve', authenticateToken, async (req, res, next) =>
       success: true,
       approvedCount,
       duplicateCount,
-      message: `Approved ${approvedCount} transactions into records (${duplicateCount} marked duplicate).`,
+      message: `Approved ${approvedCount} transactions (${duplicateCount} marked duplicate).`,
     });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
@@ -619,9 +754,6 @@ router.post('/events/bulk-approve', authenticateToken, async (req, res, next) =>
   }
 });
 
-/**
- * Bulk reject pending events
- */
 router.post('/events/bulk-reject', authenticateToken, async (req, res, next) => {
   const userId = Number(req.user.user_id);
   const eventIds = req.body?.eventIds;
@@ -657,7 +789,7 @@ router.post('/events/bulk-reject', authenticateToken, async (req, res, next) => 
 });
 
 /* ==========================================================================
-   AUTOTRACK SETTINGS
+   SETTINGS & DEVICE COMPATIBILITY (RETAINED)
    ========================================================================== */
 
 router.get('/settings', authenticateToken, async (req, res, next) => {
@@ -699,82 +831,8 @@ router.put('/settings', authenticateToken, async (req, res, next) => {
   }
 });
 
-/* ==========================================================================
-   FUTURE COMPATIBILITY: PAIRING & COMPANION DEVICE MANAGEMENT
-   (Isolated and kept for future companion phases)
-   ========================================================================== */
-
-router.post('/pairing-codes', authenticateToken, async (req, res, next) => {
-  try {
-    const userId = Number(req.user?.user_id);
-    if (!Number.isInteger(userId) || userId < 1) {
-      return res.status(401).json({ success: false, message: 'Sign in again to pair a device.' });
-    }
-
-    await query(`DELETE FROM public.autotrack_pairing_codes WHERE user_id = $1`, [userId]);
-    const code = crypto.randomBytes(18).toString('base64url');
-    await query(
-      `INSERT INTO public.autotrack_pairing_codes (user_id, code_hash, expires_at)
-       VALUES ($1, $2, NOW() + INTERVAL '10 minutes')`,
-      [userId, sha256(code)]
-    );
-
-    res.status(201).json({ success: true, pairingCode: code, expiresInSeconds: 600 });
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.post('/pair', async (req, res, next) => {
-  const code = typeof req.body?.pairingCode === 'string' ? req.body.pairingCode.trim() : '';
-  const deviceName = cleanText(req.body?.deviceName, 80, 'Android device');
-  if (code.length < 20 || code.length > 40) {
-    return res.status(400).json({ success: false, message: 'Invalid or expired pairing code.' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const pairing = await client.query(
-      `SELECT pairing_id, user_id
-         FROM public.autotrack_pairing_codes
-        WHERE code_hash = $1 AND used_at IS NULL AND expires_at > NOW()
-        FOR UPDATE`,
-      [sha256(code)]
-    );
-    if (pairing.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'Invalid or expired pairing code. Generate a new code in Finlytics.' });
-    }
-
-    const deviceId = crypto.randomUUID();
-    const token = crypto.randomBytes(32).toString('base64url');
-    const tokenHash = sha256(token);
-    const userId = pairing.rows[0].user_id;
-
-    await client.query(
-      `INSERT INTO public.autotrack_devices (device_id, user_id, device_name, token_hash)
-       VALUES ($1, $2, $3, $4)`,
-      [deviceId, userId, deviceName, tokenHash]
-    );
-    await client.query(
-      `UPDATE public.autotrack_pairing_codes SET used_at = NOW() WHERE pairing_id = $1`,
-      [pairing.rows[0].pairing_id]
-    );
-    await client.query('COMMIT');
-
-    res.status(201).json({ success: true, deviceId, deviceToken: token, deviceName });
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
-    next(error);
-  } finally {
-    client.release();
-  }
-});
-
 router.get('/devices', authenticateToken, async (req, res, next) => {
   try {
-    // Exclude internal Web Statement Importer device from mobile companion device list
     const result = await query(
       `SELECT device_id, device_name, created_at, last_seen_at
          FROM public.autotrack_devices
@@ -801,90 +859,6 @@ router.delete('/devices/:deviceId', authenticateToken, async (req, res, next) =>
     res.json({ success: true, message: 'Device disconnected.' });
   } catch (error) {
     next(error);
-  }
-});
-
-router.post('/events', authenticateAutoTrackDevice, async (req, res, next) => {
-  const inputs = req.body?.events;
-  if (!Array.isArray(inputs) || inputs.length === 0) {
-    return res.status(400).json({ success: false, message: 'No notification events were supplied.' });
-  }
-  if (inputs.length > MAX_EVENTS_PER_BATCH) {
-    return res.status(413).json({ success: false, message: `Maximum ${MAX_EVENTS_PER_BATCH} events per request.` });
-  }
-  if (Buffer.byteLength(JSON.stringify(inputs), 'utf8') > 32 * 1024) {
-    return res.status(413).json({ success: false, message: 'Notification event payload is too large.' });
-  }
-
-  let events;
-  try {
-    events = inputs.map((item) => normalizeNotificationEvent(item));
-  } catch (error) {
-    return res.status(400).json({ success: false, message: error.message });
-  }
-
-  const userId = Number(req.autoTrackDevice.user_id);
-  const client = await pool.connect();
-  const resultCounts = { received: events.length, queued: 0, autoImported: 0, duplicates: 0 };
-  try {
-    await client.query('BEGIN');
-    await client.query('UPDATE public.autotrack_devices SET last_seen_at = NOW() WHERE device_id = $1', [req.autoTrackDevice.device_id]);
-    const settingsResult = await client.query(
-      `SELECT auto_import_enabled, require_reference FROM public.autotrack_settings WHERE user_id = $1`,
-      [userId]
-    );
-    const settings = settingsResult.rows[0] || { auto_import_enabled: false, require_reference: true };
-
-    for (const item of events) {
-      const fingerprint = fingerprintForUser(userId, item);
-      const priorImport = await client.query(
-        `SELECT import_id FROM public.transaction_import_fingerprints WHERE user_id = $1 AND fingerprint = $2`,
-        [userId, fingerprint]
-      );
-      const autoEligible = settings.auto_import_enabled && (!settings.require_reference || Boolean(item.reference));
-      const initialStatus = priorImport.rowCount > 0 ? 'duplicate' : 'pending';
-      const insertedEvent = await client.query(
-        `INSERT INTO public.autotrack_events
-          (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, review_note)
-         VALUES ($1,$2,$3,$4,$5,'INR',$6,$7,$8,$9,$10,$11)
-         ON CONFLICT (user_id, fingerprint) DO NOTHING
-         RETURNING event_id, status`,
-        [userId, req.autoTrackDevice.device_id, item.sourceApp, fingerprint, item.amount, item.direction, item.date, item.merchant, item.reference, initialStatus, priorImport.rowCount > 0 ? 'Already present in the transaction ledger.' : null]
-      );
-      if (insertedEvent.rowCount === 0) {
-        resultCounts.duplicates += 1;
-        continue;
-      }
-      if (initialStatus === 'duplicate') {
-        resultCounts.duplicates += 1;
-        continue;
-      }
-      if (!autoEligible) {
-        resultCounts.queued += 1;
-        continue;
-      }
-
-      const pending = { ...item, transaction_date: item.date, fingerprint };
-      const imported = await importEvent(client, pending, userId, null, 'android_notification');
-      if (imported.duplicate) {
-        await client.query(`UPDATE public.autotrack_events SET status='duplicate', review_note='Already imported through another source.' WHERE event_id=$1`, [insertedEvent.rows[0].event_id]);
-        resultCounts.duplicates += 1;
-      } else {
-        await client.query(
-          `UPDATE public.autotrack_events SET status='approved', imported_into=$1, record_id=$2, review_note='Automatically imported: UPI reference detected.' WHERE event_id=$3`,
-          [imported.type, imported.recordId, insertedEvent.rows[0].event_id]
-        );
-        resultCounts.autoImported += 1;
-      }
-    }
-
-    await client.query('COMMIT');
-    res.status(202).json({ success: true, ...resultCounts });
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
-    next(error);
-  } finally {
-    client.release();
   }
 });
 
