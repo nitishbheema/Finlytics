@@ -1,5 +1,5 @@
--- Finlytics AutoTrack (Android Notification Access, no SMS permission)
--- Applied to project fvihctcbrpwthgvhtzrb on 2026-11-08.
+-- Finlytics AutoTrack Schema (PostgreSQL / Supabase)
+-- Supports Web Bank Statement CSV Imports & Optional Future Companion Pairing
 
 CREATE TABLE IF NOT EXISTS public.autotrack_devices (
   device_id UUID PRIMARY KEY,
@@ -27,14 +27,14 @@ CREATE INDEX IF NOT EXISTS idx_autotrack_pairing_user_created
 CREATE TABLE IF NOT EXISTS public.autotrack_events (
   event_id BIGSERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES public.users(user_id) ON DELETE CASCADE,
-  device_id UUID NOT NULL REFERENCES public.autotrack_devices(device_id) ON DELETE CASCADE,
+  device_id UUID REFERENCES public.autotrack_devices(device_id) ON DELETE CASCADE,
   source_app VARCHAR(120) NOT NULL,
   fingerprint CHAR(64) NOT NULL CHECK (fingerprint ~ '^[0-9a-f]{64}$'),
   amount NUMERIC(14,2) NOT NULL CHECK (amount > 0),
   currency CHAR(3) NOT NULL DEFAULT 'INR' CHECK (currency = 'INR'),
   direction VARCHAR(10) NOT NULL CHECK (direction IN ('debit','credit')),
   transaction_date DATE NOT NULL,
-  merchant VARCHAR(180) NOT NULL DEFAULT 'UPI transaction',
+  merchant VARCHAR(180) NOT NULL DEFAULT 'Bank Transaction',
   reference VARCHAR(150),
   status VARCHAR(12) NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','approved','rejected','duplicate')),
@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS public.autotrack_events (
 CREATE INDEX IF NOT EXISTS idx_autotrack_events_user_status_date
   ON public.autotrack_events(user_id, status, transaction_date DESC);
 
+-- Allow web-only statement imports without requiring a paired device
+ALTER TABLE public.autotrack_events ALTER COLUMN device_id DROP NOT NULL;
 ALTER TABLE public.autotrack_events ADD COLUMN IF NOT EXISTS review_note VARCHAR(240);
 ALTER TABLE public.autotrack_events DROP CONSTRAINT IF EXISTS autotrack_events_status_check;
 ALTER TABLE public.autotrack_events ADD CONSTRAINT autotrack_events_status_check
@@ -60,18 +62,32 @@ CREATE TABLE IF NOT EXISTS public.autotrack_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS public.transaction_import_fingerprints (
+  import_id BIGSERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES public.users(user_id) ON DELETE CASCADE,
+  fingerprint CHAR(64) NOT NULL CHECK (fingerprint ~ '^[0-9a-f]{64}$'),
+  source VARCHAR(32) NOT NULL DEFAULT 'csv',
+  transaction_type VARCHAR(10) NOT NULL CHECK (transaction_type IN ('expense','income')),
+  record_id INTEGER,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_import_fingerprint UNIQUE (user_id, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_import_fingerprints_lookup ON public.transaction_import_fingerprints(user_id, fingerprint);
+
 ALTER TABLE public.transaction_import_fingerprints
   DROP CONSTRAINT IF EXISTS transaction_import_fingerprints_source_check;
 ALTER TABLE public.transaction_import_fingerprints
   ADD CONSTRAINT transaction_import_fingerprints_source_check
-  CHECK (source IN ('csv','android_sms','android_notification','account_aggregator','email'));
+  CHECK (source IN ('csv','web_statement','android_sms','android_notification','account_aggregator','email'));
 
 ALTER TABLE public.autotrack_devices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.autotrack_pairing_codes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.autotrack_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.autotrack_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.transaction_import_fingerprints ENABLE ROW LEVEL SECURITY;
 
 REVOKE ALL ON TABLE public.autotrack_devices FROM anon, authenticated;
 REVOKE ALL ON TABLE public.autotrack_pairing_codes FROM anon, authenticated;
 REVOKE ALL ON TABLE public.autotrack_events FROM anon, authenticated;
 REVOKE ALL ON TABLE public.autotrack_settings FROM anon, authenticated;
+REVOKE ALL ON TABLE public.transaction_import_fingerprints FROM anon, authenticated;
