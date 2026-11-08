@@ -232,43 +232,134 @@ router.post('/csv/auto-import', authenticateToken, async (req, res, next) => {
 
       // REFUND ACCOUNTING: Offset expense without inflating income
       if (isRefund) {
-        // Look for matching original expense
+        // Look for matching original positive expense (prevent double-counting and concurrent races)
         let matchedExpense = null;
+        let isAmbiguousMatch = false;
+
+        // A. Conservative Reference-based matching (Payment ref, Order ID, or referenced Txn ID)
+        const candidateRefs = new Set();
         if (item.reference) {
-          const mRes = await client.query(
-            `SELECT expense_id, amount, description FROM public.expenses
-              WHERE user_id = $1 AND (description LIKE '%' || $2 || '%' OR expense_id IN (SELECT record_id FROM public.transaction_import_fingerprints WHERE user_id = $1 AND fingerprint LIKE '%' || $2 || '%'))
-              LIMIT 1`,
-            [userId, item.reference]
-          );
-          if (mRes.rowCount > 0) matchedExpense = mRes.rows[0];
-        }
-        if (!matchedExpense) {
-          const mRes = await client.query(
-            `SELECT expense_id, amount, description FROM public.expenses
-              WHERE user_id = $1 AND LOWER(description) LIKE '%' || LOWER($2) || '%' AND expense_date <= $3::date AND expense_date >= ($3::date - INTERVAL '60 days')
-              ORDER BY (amount = $4) DESC, expense_date DESC LIMIT 1`,
-            [userId, item.merchant, item.transactionDate, item.amount]
-          );
-          if (mRes.rowCount > 0) matchedExpense = mRes.rows[0];
+          candidateRefs.add(item.reference.trim());
         }
 
+        const combinedRefText = `${item.description || ''} ${item.merchant || ''} ${item.rawText || ''}`;
+        const refPatterns = [
+          /(?:order\s*ref|order\s*id|ref\s*no|ref|txn|txnid|rrn)[:\s#]+([A-Za-z0-9_-]{3,})/gi,
+          /\b(SYNTH_[A-Za-z0-9_]+)\b/g,
+          /\b([0-9]{12})\b/g,
+        ];
+
+        for (const pattern of refPatterns) {
+          let match;
+          while ((match = pattern.exec(combinedRefText)) !== null) {
+            if (match[1] && match[1].trim()) {
+              candidateRefs.add(match[1].trim());
+            }
+          }
+        }
+
+        for (const refCandidate of candidateRefs) {
+          if (!refCandidate || refCandidate.length < 3) continue;
+          const mRes = await client.query(
+            `SELECT expense_id, category_id, amount, description FROM public.expenses
+              WHERE user_id = $1 AND amount > 0 AND (
+                description LIKE '%' || $2 || '%'
+                OR expense_id IN (SELECT record_id FROM public.transaction_import_fingerprints WHERE user_id = $1 AND fingerprint LIKE '%' || $2 || '%')
+              )
+              ORDER BY expense_date DESC LIMIT 1
+              FOR UPDATE`,
+            [userId, refCandidate]
+          );
+          if (mRes.rowCount > 0) {
+            matchedExpense = mRes.rows[0];
+            break;
+          }
+        }
+
+        // B. Conservative Merchant & Amount matching (only if reference didn't match and merchant is specific)
+        if (!matchedExpense && item.merchant && !['UPI Transaction', 'Bank Transaction', 'Payment', 'Transaction'].includes(item.merchant)) {
+          const mRes = await client.query(
+            `SELECT expense_id, category_id, amount, description FROM public.expenses
+              WHERE user_id = $1 AND amount > 0
+                AND LOWER(description) LIKE '%' || LOWER($2) || '%'
+                AND amount = $3
+                AND expense_date <= $4::date
+                AND expense_date >= ($4::date - INTERVAL '60 days')
+              ORDER BY expense_date DESC LIMIT 2
+              FOR UPDATE`,
+            [userId, item.merchant, item.amount, item.transactionDate]
+          );
+          if (mRes.rowCount === 1) {
+            matchedExpense = mRes.rows[0];
+          } else if (mRes.rowCount > 1) {
+            // Multiple purchases with identical amount and merchant: ambiguous, do not guess
+            isAmbiguousMatch = true;
+          }
+        }
+
+        // Verify remaining balance on matched expense (prevent over-refunding and concurrent race)
+        if (matchedExpense) {
+          const checkRefundedRes = await client.query(
+            `SELECT COALESCE(SUM(ABS(amount)), 0) AS total_refunded
+             FROM public.expenses
+             WHERE user_id = $1 AND amount < 0 AND (
+               description LIKE '%OrigId: ' || $2 || '%'
+               OR description LIKE '%' || $3 || '%'
+               OR (description LIKE '%' || $4 || '%' AND $4 <> 'N/A')
+             )`,
+            [userId, matchedExpense.expense_id, matchedExpense.description, item.reference || 'N/A']
+          );
+          const alreadyRefunded = parseFloat(checkRefundedRes.rows[0].total_refunded || 0);
+          const originalAmount = parseFloat(matchedExpense.amount);
+          const remainingRefundable = Math.max(0, parseFloat((originalAmount - alreadyRefunded).toFixed(2)));
+
+          // Check if incoming refund exceeds remaining balance
+          if (item.amount > remainingRefundable) {
+            // DO NOT silently cap or import incorrect financial amount
+            const reason = `Refund amount (₹${item.amount.toFixed(2)}) exceeds remaining refundable balance (₹${remainingRefundable.toFixed(2)}) on original expense (₹${originalAmount.toFixed(2)}: ${matchedExpense.description}). Transaction rejected.`;
+            await client.query(
+              `INSERT INTO public.autotrack_events
+                (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, review_note)
+               VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', 'credit', $5, $6, $7, 'rejected', $8)
+               ON CONFLICT (user_id, fingerprint) DO UPDATE
+                 SET status = 'rejected', review_note = EXCLUDED.review_note`,
+              [userId, webDeviceId, item.fingerprint, item.amount, item.transactionDate, item.merchant, item.reference, reason]
+            );
+
+            parsedStatement.skippedFailedRows.push({
+              rowNumber: item.rowNumber,
+              status: 'EXCEEDS_BALANCE',
+              reason,
+              rawData: item
+            });
+            continue;
+          }
+        }
+
+        const isExactFullRefund = matchedExpense && Math.abs(item.amount - parseFloat(matchedExpense.amount)) < 0.01;
+        const refundTypeLabel = isExactFullRefund ? 'Full Refund' : 'Partial Refund';
         const refundDesc = matchedExpense
-          ? `[Full Refund] Offset for ${matchedExpense.description} (Ref: ${item.reference || 'N/A'})`
-          : `[Refund] ${item.merchant} (Ref: ${item.reference || 'N/A'})`;
+          ? `[${refundTypeLabel}] Offset for ${matchedExpense.description} (Ref: ${item.reference || 'N/A'}, OrigId: ${matchedExpense.expense_id})`
+          : `[Refund] ${item.merchant}${isAmbiguousMatch ? ' [Ambiguous Match]' : ''} (Ref: ${item.reference || 'N/A'})`;
+
+        // Associate refund with original category if matched, otherwise fallback to Refunds & Reversals
+        const targetCatId = matchedExpense ? matchedExpense.category_id : refundCatId;
+        const targetCatName = matchedExpense
+          ? (dbCategories.find(c => c.category_id === matchedExpense.category_id)?.category_name || 'Refunds & Reversals')
+          : 'Refunds & Reversals';
 
         // Insert as negative expense offset
         const insRes = await client.query(
           `INSERT INTO public.expenses (user_id, category_id, amount, expense_date, description)
            VALUES ($1, $2, $3, $4, $5) RETURNING expense_id`,
-          [userId, refundCatId, -item.amount, item.transactionDate, refundDesc]
+          [userId, targetCatId, -item.amount, item.transactionDate, refundDesc]
         );
         insertedRecordId = insRes.rows[0].expense_id;
 
         importedRefundsCount++;
         totalRefundAmount += item.amount;
         totalExpenseAmount -= item.amount; // offsets expenses
-        categoryCounts['Refunds & Reversals'] = (categoryCounts['Refunds & Reversals'] || 0) + 1;
+        categoryCounts[targetCatName] = (categoryCounts[targetCatName] || 0) + 1;
       } else if (isDebit) {
         // NORMAL EXPENSE DEBIT
         let catId = item.categoryId;
@@ -348,6 +439,7 @@ router.post('/csv/auto-import', authenticateToken, async (req, res, next) => {
 
     // Record skipped failed status rows (using actual source row number!)
     for (const failedItem of parsedStatement.skippedFailedRows) {
+      if (failedItem.status === 'EXCEEDS_BALANCE') continue; // already recorded in autotrack_events with full transaction details
       const failedFp = sha256(`failed|${userId}|${failedItem.rowNumber}|${failedItem.reason}`);
       await client.query(
         `INSERT INTO public.autotrack_events

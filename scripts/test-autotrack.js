@@ -125,6 +125,10 @@ assert.equal(isSuccessfulStatus('FAILURE'), false);
 assert.equal(isSuccessfulStatus('FAILED'), false);
 assert.equal(isSuccessfulStatus('DECLINED'), false);
 assert.equal(isSuccessfulStatus('PENDING'), false);
+assert.equal(isSuccessfulStatus(''), false, 'Empty status must not be treated as success');
+assert.equal(isSuccessfulStatus('   '), false, 'Whitespace status must not be treated as success');
+assert.equal(isSuccessfulStatus(null), false, 'Null status must not be treated as success');
+assert.equal(isSuccessfulStatus(undefined), false, 'Undefined status must not be treated as success');
 console.log('  ✅ PASS: Clean counterparty extraction and rigorous success/failure filtering');
 
 // ============================================================
@@ -225,6 +229,8 @@ const refundStatementCsv = `Date,Time,Bank Name,Account Number,Sender,Receiver,P
 02/11/2026,11:00:00,DEMO BANK,XXXX1234,merchant@upi(Full Refund for Order 123),user@upi(DEMO USER),SYNTH001122334456,COLLECT,1500.00,CR,SUCCESS
 03/11/2026,12:00:00,DEMO BANK,XXXX1234,merchant@upi(Partial Refund for Item A),user@upi(DEMO USER),SYNTH001122334457,COLLECT,450.00,CR,SUCCESS
 04/11/2026,13:00:00,DEMO BANK,XXXX1234,bank@upi(UPI Reversal of Ref 9988),user@upi(DEMO USER),SYNTH001122334458,COLLECT,300.00,CR,SUCCESS
+05/11/2026,14:00:00,DEMO BANK,XXXX1234,user@upi(DEMO USER),merchant@upi(Missing Status Txn),SYNTH001122334459,PAY,750.00,DR,
+MALFORMED_LINE_WITHOUT_REQUIRED_FIELDS
 02/11/2026,11:00:00,DEMO BANK,XXXX1234,merchant@upi(Full Refund for Order 123),user@upi(DEMO USER),SYNTH001122334456,COLLECT,1500.00,CR,SUCCESS`;
 
 const refundParsed = parseAndNormalizeStatement(refundStatementCsv, {
@@ -234,6 +240,9 @@ const refundParsed = parseAndNormalizeStatement(refundStatementCsv, {
 
 assert.equal(refundParsed.successfulRows.length, 4, '4 valid unique rows');
 assert.equal(refundParsed.duplicateRows.length, 1, '1 duplicate refund row caught within statement');
+assert.equal(refundParsed.skippedFailedRows.length, 1, '1 row with missing status in statement with status column skipped');
+assert.equal(refundParsed.skippedFailedRows[0].status, 'MISSING');
+assert.equal(refundParsed.invalidRows.length, 1, '1 structurally malformed row rejected in invalidRows');
 
 const originalTx = refundParsed.successfulRows[0];
 const fullRefundTx = refundParsed.successfulRows[1];

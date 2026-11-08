@@ -313,7 +313,7 @@ export function cleanUpiEntity(raw) {
  * Rejects failed, declined, cancelled, or pending transactions.
  */
 export function isSuccessfulStatus(statusRaw) {
-  if (!statusRaw || typeof statusRaw !== 'string') return true;
+  if (!statusRaw || typeof statusRaw !== 'string' || statusRaw.trim().length === 0) return false;
   const s = statusRaw.trim().toUpperCase();
   if (s === 'SUCCESS' || s === 'SUCCESSFUL' || s === 'COMPLETED' || s === 'PAID' || s === 'DONE' || s === 'EXECUTED' || s === 'PROCESSED' || s === 'CLEARED') {
     return true;
@@ -638,22 +638,7 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
       continue;
     }
 
-    // 1. Status Check (SUCCESS vs. FAILURE / DECLINED)
-    const rawStatus = activeMapping.statusCol >= 0 && activeMapping.statusCol < row.length
-      ? row[activeMapping.statusCol]
-      : null;
-
-    if (rawStatus && !isSuccessfulStatus(rawStatus)) {
-      skippedFailedRows.push({
-        rowNumber,
-        status: rawStatus.trim(),
-        reason: `Payment status was '${rawStatus.trim()}'. Non-successful transactions are skipped.`,
-        rawData: row,
-      });
-      continue;
-    }
-
-    // 2. Date parsing
+    // 1. Structural Validation: Date parsing
     const rawDate = activeMapping.dateCol >= 0 && activeMapping.dateCol < row.length ? row[activeMapping.dateCol] : '';
     const parsedDate = parseDateString(rawDate, activeMapping.dateFormat || 'auto');
     if (!parsedDate) {
@@ -665,7 +650,7 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
       continue;
     }
 
-    // 3. Direction and Amount
+    // 2. Structural Validation: Direction and Amount
     let amount = null;
     let direction = null;
 
@@ -721,6 +706,21 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
         rawData: row,
       });
       continue;
+    }
+
+    // 3. Status Check (Evaluated only for structurally valid rows)
+    if (activeMapping.statusCol >= 0) {
+      const rawStatus = activeMapping.statusCol < row.length ? row[activeMapping.statusCol] : '';
+      if (!isSuccessfulStatus(rawStatus)) {
+        const displayStatus = (rawStatus || '').trim() || 'MISSING';
+        skippedFailedRows.push({
+          rowNumber,
+          status: displayStatus,
+          reason: `Payment status is '${displayStatus}'. Missing or non-successful status entries are skipped when statement includes a status column.`,
+          rawData: row,
+        });
+        continue;
+      }
     }
 
     // 4. Counterparty & Narration Extraction
@@ -781,6 +781,7 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
       isRefund,
       merchant: cleanMerchant,
       description: cleanDescription,
+      rawText: fullContextText,
       reference,
       fingerprint,
       categoryId: categoryResult.categoryId,
