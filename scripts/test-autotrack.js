@@ -142,6 +142,7 @@ const mockCategories = [
   { category_id: 11, category_name: 'Investment', category_type: 'income' },
   { category_id: 12, category_name: 'Bonus', category_type: 'income' },
   { category_id: 17, category_name: 'Other Income', category_type: 'income' },
+  { category_id: 18, category_name: 'Refunds & Reversals', category_type: 'expense' },
 ];
 
 const catSwiggy = autoCategorize('Payment to Swiggy Bangalore', 'debit', mockCategories);
@@ -162,9 +163,12 @@ assert.equal(catSalary.categoryName, 'Salary');
 const catCashback = autoCategorize('Cashback Reward from Cred', 'credit', mockCategories);
 assert.equal(catCashback.categoryName, 'Bonus');
 
+const catRefund = autoCategorize('Refund from Merchant Order', 'credit', mockCategories, true);
+assert.equal(catRefund.categoryName, 'Refunds & Reversals', 'Refunds must always categorize to Refunds & Reversals expense');
+
 const catUnknownExpense = autoCategorize('Payment to Random Person X', 'debit', mockCategories);
 assert.equal(catUnknownExpense.categoryName, 'Other Expense');
-console.log('  ✅ PASS: Accurate auto-categorization across expense and income rules with safe fallbacks');
+console.log('  ✅ PASS: Accurate auto-categorization across expense and income rules with safe fallbacks and refunds');
 
 // ============================================================
 // 6. Full Automated Statement Parsing & Deduplication Lifecycle
@@ -172,13 +176,13 @@ console.log('  ✅ PASS: Accurate auto-categorization across expense and income 
 console.log('--- Test Suite 6: Full Statement Parsing, Reversals & Deduplication ---');
 
 const sampleUpiCsv = `,,,,Transaction History,,,,,,
-Customer Mobile Number: +917780124320,,,,,,,Transaction History from 12/05/2026 to 08/11/2026,,,
+Customer Mobile Number: +919876543210,,,,,,,Transaction History from 12/05/2026 to 08/11/2026,,,
 Date,Time,Bank Name,Account Number,Sender,Receiver,Payment ID/Reference Number,Pay/Collect,Amount (in Rs.),DR/CR,Status
-08/11/2026,10:20:24,UNION BANK OF INDIA,XXXX0189,xxxxx24320@upi(BHEEMA NITISH),swiggy@icici(Swiggy Order),102024302967,PAY,450,DR,SUCCESS
-07/11/2026,14:07:39,UNION BANK OF INDIA,XXXX0189,payroll@infosys(Infosys Tech),xxxxx24320@upi(BHEEMA NITISH),830877339457,COLLECT,85000,CR,SUCCESS
-07/11/2026,13:00:00,UNION BANK OF INDIA,XXXX0189,xxxxx24320@upi(BHEEMA NITISH),uber@axis(Uber Ride),998877665544,PAY,320,DR,FAILURE
-06/11/2026,12:00:00,UNION BANK OF INDIA,XXXX0189,merchant@upi(Refund for Order),xxxxx24320@upi(BHEEMA NITISH),112233445566,COLLECT,450,CR,SUCCESS
-08/11/2026,10:20:24,UNION BANK OF INDIA,XXXX0189,xxxxx24320@upi(BHEEMA NITISH),swiggy@icici(Swiggy Order),102024302967,PAY,450,DR,SUCCESS`;
+08/11/2026,10:20:24,DEMO BANK,XXXX1234,user@upi(DEMO USER),swiggy@icici(Swiggy Order),SYNTH999888777111,PAY,450,DR,SUCCESS
+07/11/2026,14:07:39,DEMO BANK,XXXX1234,payroll@infosys(Infosys Tech),user@upi(DEMO USER),SYNTH888777666222,COLLECT,85000,CR,SUCCESS
+07/11/2026,13:00:00,DEMO BANK,XXXX1234,user@upi(DEMO USER),uber@axis(Uber Ride),SYNTH777666555333,PAY,320,DR,FAILURE
+06/11/2026,12:00:00,DEMO BANK,XXXX1234,merchant@upi(Refund for Order),user@upi(DEMO USER),SYNTH666555444333,COLLECT,450,CR,SUCCESS
+08/11/2026,10:20:24,DEMO BANK,XXXX1234,user@upi(DEMO USER),swiggy@icici(Swiggy Order),SYNTH999888777111,PAY,450,DR,SUCCESS`;
 
 const parsed1 = parseAndNormalizeStatement(sampleUpiCsv, {
   userId: 42,
@@ -197,7 +201,8 @@ assert.equal(parsed1.successfulRows[0].categoryName, 'Food');
 assert.equal(parsed1.successfulRows[1].direction, 'credit');
 assert.equal(parsed1.successfulRows[1].categoryName, 'Salary');
 assert.equal(parsed1.successfulRows[2].direction, 'credit'); // Refund
-assert.equal(parsed1.successfulRows[2].categoryName, 'Bonus');
+assert.equal(parsed1.successfulRows[2].isRefund, true);
+assert.equal(parsed1.successfulRows[2].categoryName, 'Refunds & Reversals');
 
 // Verify second upload with existing fingerprints (100% deduplication)
 const existingFingerprints = new Set(parsed1.successfulRows.map(r => r.fingerprint));
@@ -211,36 +216,63 @@ assert.equal(parsed2.duplicateRows.length, 4, 'All previously imported items mar
 console.log('  ✅ PASS: 100% duplicate prevention across re-uploads and failed rows skipped cleanly');
 
 // ============================================================
-// 7. Verify Local Statement Fixture If Available
+// 7. Unit Tests for Full Refunds, Partial Refunds, Reversals, and Duplicate Refunds
 // ============================================================
-console.log('--- Test Suite 7: Local Fixture Validation (Transaction_Statement.csv) ---');
-const localFixturePath = 'C:\\Users\\Nitish\\Downloads\\Transaction_Statement.csv';
-if (fs.existsSync(localFixturePath)) {
-  const fileContent = fs.readFileSync(localFixturePath, 'utf8');
-  const fixtureRes = parseAndNormalizeStatement(fileContent, {
-    userId: 99,
-    categories: mockCategories,
-  });
+console.log('--- Test Suite 7: Full Refunds, Partial Refunds, Reversals & Deduplication ---');
 
-  assert.equal(fixtureRes.formatId, 'upi_unified');
-  assert.equal(fixtureRes.isRecognized, true);
-  assert.equal(fixtureRes.successfulRows.length, 932);
-  assert.equal(fixtureRes.skippedFailedRows.length, 26);
-  assert.equal(fixtureRes.invalidRows.length, 0);
+const refundStatementCsv = `Date,Time,Bank Name,Account Number,Sender,Receiver,Payment ID/Reference Number,Pay/Collect,Amount (in Rs.),DR/CR,Status
+01/11/2026,10:00:00,DEMO BANK,XXXX1234,user@upi(DEMO USER),merchant@upi(Original Purchase),SYNTH001122334455,PAY,1500.00,DR,SUCCESS
+02/11/2026,11:00:00,DEMO BANK,XXXX1234,merchant@upi(Full Refund for Order 123),user@upi(DEMO USER),SYNTH001122334456,COLLECT,1500.00,CR,SUCCESS
+03/11/2026,12:00:00,DEMO BANK,XXXX1234,merchant@upi(Partial Refund for Item A),user@upi(DEMO USER),SYNTH001122334457,COLLECT,450.00,CR,SUCCESS
+04/11/2026,13:00:00,DEMO BANK,XXXX1234,bank@upi(UPI Reversal of Ref 9988),user@upi(DEMO USER),SYNTH001122334458,COLLECT,300.00,CR,SUCCESS
+02/11/2026,11:00:00,DEMO BANK,XXXX1234,merchant@upi(Full Refund for Order 123),user@upi(DEMO USER),SYNTH001122334456,COLLECT,1500.00,CR,SUCCESS`;
 
-  // Re-run for complete deduplication test
-  const existingSet = new Set(fixtureRes.successfulRows.map(r => r.fingerprint));
-  const reUploadRes = parseAndNormalizeStatement(fileContent, {
-    userId: 99,
-    categories: mockCategories,
-    existingFingerprints: existingSet,
-  });
-  assert.equal(reUploadRes.successfulRows.length, 0);
-  assert.equal(reUploadRes.duplicateRows.length, 932);
-  console.log(`  ✅ PASS: Verified 958 rows in local fixture: 932 successful imported, 26 failed skipped, 100% deduplicated on re-upload`);
-} else {
-  console.log('  ℹ️  Notice: Local fixture Transaction_Statement.csv not in Downloads path, skipped file fixture');
-}
+const refundParsed = parseAndNormalizeStatement(refundStatementCsv, {
+  userId: 101,
+  categories: mockCategories,
+});
+
+assert.equal(refundParsed.successfulRows.length, 4, '4 valid unique rows');
+assert.equal(refundParsed.duplicateRows.length, 1, '1 duplicate refund row caught within statement');
+
+const originalTx = refundParsed.successfulRows[0];
+const fullRefundTx = refundParsed.successfulRows[1];
+const partialRefundTx = refundParsed.successfulRows[2];
+const reversalTx = refundParsed.successfulRows[3];
+
+// 1. Original debit
+assert.equal(originalTx.direction, 'debit');
+assert.equal(originalTx.amount, 1500);
+assert.equal(originalTx.isRefund, false);
+
+// 2. Full refund
+assert.equal(fullRefundTx.direction, 'credit');
+assert.equal(fullRefundTx.amount, 1500);
+assert.equal(fullRefundTx.isRefund, true);
+assert.equal(fullRefundTx.categoryName, 'Refunds & Reversals');
+
+// 3. Partial refund
+assert.equal(partialRefundTx.direction, 'credit');
+assert.equal(partialRefundTx.amount, 450);
+assert.equal(partialRefundTx.isRefund, true);
+assert.equal(partialRefundTx.categoryName, 'Refunds & Reversals');
+
+// 4. Reversal
+assert.equal(reversalTx.direction, 'credit');
+assert.equal(reversalTx.amount, 300);
+assert.equal(reversalTx.isRefund, true);
+assert.equal(reversalTx.categoryName, 'Refunds & Reversals');
+
+// 5. Duplicate refund record deduplication test across runs
+const refundFingerprints = new Set(refundParsed.successfulRows.map(r => r.fingerprint));
+const reUploadRefundParsed = parseAndNormalizeStatement(refundStatementCsv, {
+  userId: 101,
+  categories: mockCategories,
+  existingFingerprints: refundFingerprints,
+});
+assert.equal(reUploadRefundParsed.successfulRows.length, 0, 'Re-uploading refunds imports zero duplicates');
+assert.equal(reUploadRefundParsed.duplicateRows.length, 5, 'All rows detected as duplicates on re-upload');
+console.log('  ✅ PASS: Full refunds, partial refunds, reversals, and duplicate refund records validated');
 
 console.log('\n========================================');
 console.log('AutoTrack Automated Import Tests: All Passed!');

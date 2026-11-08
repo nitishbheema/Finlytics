@@ -68,7 +68,7 @@ async function findFallbackCategory(client, type) {
  * Helper to insert single event into core tables
  */
 async function importEvent(client, event, userId, categoryId = null, source = 'csv') {
-  const type = event.direction === 'debit' ? 'expense' : 'income';
+  const type = event.direction === 'debit' ? 'expense' : (event.isRefund ? 'expense' : 'income');
   let targetCategoryId = categoryId;
   if (targetCategoryId) {
     const category = await client.query(
@@ -84,53 +84,46 @@ async function importEvent(client, event, userId, categoryId = null, source = 'c
 
   const fingerprint = event.fingerprint;
 
-  let claim;
-  try {
-    claim = await client.query(
-      `INSERT INTO public.transaction_import_fingerprints (user_id, fingerprint, source, transaction_type)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (user_id, fingerprint) DO NOTHING
-       RETURNING import_id`,
-      [userId, fingerprint, source, type]
-    );
-  } catch (err) {
-    claim = { rowCount: 1, rows: [{ import_id: null }] };
-  }
+  // Claim fingerprint atomically inside transaction
+  const claim = await client.query(
+    `INSERT INTO public.transaction_import_fingerprints (user_id, fingerprint, source, transaction_type)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id, fingerprint) DO NOTHING
+     RETURNING import_id`,
+    [userId, fingerprint, source, type]
+  );
 
   if (claim.rowCount === 0) return { duplicate: true };
 
   let inserted;
   if (type === 'expense') {
+    const expenseAmount = event.isRefund ? -Math.abs(event.amount) : Math.abs(event.amount);
     inserted = await client.query(
       `INSERT INTO public.expenses (user_id, category_id, amount, expense_date, description)
        VALUES ($1, $2, $3, $4, $5) RETURNING expense_id`,
-      [userId, targetCategoryId, event.amount, event.transaction_date, event.description || event.merchant]
+      [userId, targetCategoryId, expenseAmount, event.transaction_date, event.description || event.merchant]
     );
-    if (claim.rows[0]?.import_id) {
-      await client.query('UPDATE public.transaction_import_fingerprints SET record_id = $1 WHERE import_id = $2', [
-        inserted.rows[0].expense_id,
-        claim.rows[0].import_id,
-      ]);
-    }
+    await client.query('UPDATE public.transaction_import_fingerprints SET record_id = $1 WHERE import_id = $2', [
+      inserted.rows[0].expense_id,
+      claim.rows[0].import_id,
+    ]);
     return { duplicate: false, type, recordId: inserted.rows[0].expense_id };
   }
 
   inserted = await client.query(
     `INSERT INTO public.transactions (user_id, category_id, amount, type, description, transaction_date)
      VALUES ($1, $2, $3, 'income', $4, $5) RETURNING transaction_id`,
-    [userId, targetCategoryId, event.amount, event.description || event.merchant, event.transaction_date]
+    [userId, targetCategoryId, Math.abs(event.amount), event.description || event.merchant, event.transaction_date]
   );
-  if (claim.rows[0]?.import_id) {
-    await client.query('UPDATE public.transaction_import_fingerprints SET record_id = $1 WHERE import_id = $2', [
-      inserted.rows[0].transaction_id,
-      claim.rows[0].import_id,
-    ]);
-  }
+  await client.query('UPDATE public.transaction_import_fingerprints SET record_id = $1 WHERE import_id = $2', [
+    inserted.rows[0].transaction_id,
+    claim.rows[0].import_id,
+  ]);
   return { duplicate: false, type, recordId: inserted.rows[0].transaction_id };
 }
 
 /* ==========================================================================
-   FULLY AUTOMATED CSV-BASED IMPORT ENDPOINT (ONE-CLICK)
+   FULLY AUTOMATED CSV-BASED IMPORT ENDPOINT (ONE-CLICK & CONCURRENCY-SAFE)
    ========================================================================== */
 
 router.post('/csv/auto-import', authenticateToken, async (req, res, next) => {
@@ -145,23 +138,20 @@ router.post('/csv/auto-import', authenticateToken, async (req, res, next) => {
     return res.status(413).json({ success: false, message: 'CSV statement file exceeds 10MB limit.' });
   }
 
+  const client = await pool.connect();
   try {
-    // 1. Fetch user's categories from database
-    const catResult = await query(
+    // 1. Fetch user categories from database
+    const catResult = await client.query(
       `SELECT category_id, category_name, category_type FROM public.categories ORDER BY category_id ASC`
     );
     const dbCategories = catResult.rows;
 
-    // 2. Fetch existing fingerprints for deduplication
-    const existingFingerprints = new Set();
-    try {
-      const [claimedFp, eventFp] = await Promise.all([
-        query('SELECT fingerprint FROM public.transaction_import_fingerprints WHERE user_id = $1', [userId]),
-        query("SELECT fingerprint FROM public.autotrack_events WHERE user_id = $1 AND status != 'rejected'", [userId]),
-      ]);
-      claimedFp.rows.forEach(r => existingFingerprints.add(r.fingerprint));
-      eventFp.rows.forEach(r => existingFingerprints.add(r.fingerprint));
-    } catch (e) {}
+    // 2. Fetch existing fingerprints for user
+    const claimedFp = await client.query(
+      'SELECT fingerprint FROM public.transaction_import_fingerprints WHERE user_id = $1',
+      [userId]
+    );
+    const existingFingerprints = new Set(claimedFp.rows.map(r => r.fingerprint));
 
     // 3. Parse and normalize statement
     const parsedStatement = parseAndNormalizeStatement(csvText, {
@@ -171,7 +161,6 @@ router.post('/csv/auto-import', authenticateToken, async (req, res, next) => {
       customMapping,
     });
 
-    // If format is completely unrecognized and no custom mapping was provided, prompt user for mapping
     if (!parsedStatement.isRecognized && !customMapping) {
       return res.json({
         success: true,
@@ -184,149 +173,224 @@ router.post('/csv/auto-import', authenticateToken, async (req, res, next) => {
       });
     }
 
-    // 4. Batch Import Eligible Transactions in a single atomic DB transaction
-    const client = await pool.connect();
+    // 4. Atomic Database Transaction with Concurrency-Safe Fingerprint Claiming
+    await client.query('BEGIN');
     const webDeviceId = await getOrCreateWebDevice(client, userId);
 
     let importedExpensesCount = 0;
     let importedIncomeCount = 0;
+    let importedRefundsCount = 0;
+    let duplicateCount = 0;
     let totalExpenseAmount = 0;
     let totalIncomeAmount = 0;
+    let totalRefundAmount = 0;
     const categoryCounts = {};
 
-    try {
-      await client.query('BEGIN');
+    // Get or ensure 'Refunds & Reversals' category exists
+    let refundCatId = dbCategories.find(c =>
+      c.category_type === 'expense' && c.category_name.toLowerCase().includes('refund')
+    )?.category_id;
+    if (!refundCatId) {
+      const insCat = await client.query(
+        `INSERT INTO public.categories (category_name, category_type)
+         VALUES ('Refunds & Reversals', 'expense')
+         ON CONFLICT (category_name, category_type) DO UPDATE SET category_type = 'expense'
+         RETURNING category_id`
+      );
+      refundCatId = insCat.rows[0].category_id;
+    }
 
-      // Process successful non-duplicate rows
-      for (const item of parsedStatement.successfulRows) {
-        const isDebit = item.direction === 'debit';
-        const type = isDebit ? 'expense' : 'income';
+    for (const item of parsedStatement.successfulRows) {
+      const isDebit = item.direction === 'debit';
+      const isRefund = Boolean(item.isRefund);
+      const type = isDebit ? 'expense' : (isRefund ? 'expense' : 'income');
 
-        // Safe category assignment
+      // CONCURRENCY-SAFE CLAIM: Insert into transaction_import_fingerprints inside transaction
+      const claimRes = await client.query(
+        `INSERT INTO public.transaction_import_fingerprints (user_id, fingerprint, source, transaction_type)
+         VALUES ($1, $2, 'csv', $3)
+         ON CONFLICT (user_id, fingerprint) DO NOTHING
+         RETURNING import_id`,
+        [userId, item.fingerprint, type]
+      );
+
+      // If rowCount === 0, another concurrent request or prior upload already claimed it!
+      if (claimRes.rowCount === 0) {
+        duplicateCount++;
+        await client.query(
+          `INSERT INTO public.autotrack_events
+            (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, review_note)
+           VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'duplicate', 'Duplicate skipped: already present in records.')
+           ON CONFLICT (user_id, fingerprint) DO NOTHING`,
+          [userId, webDeviceId, item.fingerprint, item.amount, item.direction, item.transactionDate, item.merchant, item.reference]
+        );
+        continue; // Skip financial record insert!
+      }
+
+      const importId = claimRes.rows[0].import_id;
+      let insertedRecordId = null;
+
+      // REFUND ACCOUNTING: Offset expense without inflating income
+      if (isRefund) {
+        // Look for matching original expense
+        let matchedExpense = null;
+        if (item.reference) {
+          const mRes = await client.query(
+            `SELECT expense_id, amount, description FROM public.expenses
+              WHERE user_id = $1 AND (description LIKE '%' || $2 || '%' OR expense_id IN (SELECT record_id FROM public.transaction_import_fingerprints WHERE user_id = $1 AND fingerprint LIKE '%' || $2 || '%'))
+              LIMIT 1`,
+            [userId, item.reference]
+          );
+          if (mRes.rowCount > 0) matchedExpense = mRes.rows[0];
+        }
+        if (!matchedExpense) {
+          const mRes = await client.query(
+            `SELECT expense_id, amount, description FROM public.expenses
+              WHERE user_id = $1 AND LOWER(description) LIKE '%' || LOWER($2) || '%' AND expense_date <= $3::date AND expense_date >= ($3::date - INTERVAL '60 days')
+              ORDER BY (amount = $4) DESC, expense_date DESC LIMIT 1`,
+            [userId, item.merchant, item.transactionDate, item.amount]
+          );
+          if (mRes.rowCount > 0) matchedExpense = mRes.rows[0];
+        }
+
+        const refundDesc = matchedExpense
+          ? `[Full Refund] Offset for ${matchedExpense.description} (Ref: ${item.reference || 'N/A'})`
+          : `[Refund] ${item.merchant} (Ref: ${item.reference || 'N/A'})`;
+
+        // Insert as negative expense offset
+        const insRes = await client.query(
+          `INSERT INTO public.expenses (user_id, category_id, amount, expense_date, description)
+           VALUES ($1, $2, $3, $4, $5) RETURNING expense_id`,
+          [userId, refundCatId, -item.amount, item.transactionDate, refundDesc]
+        );
+        insertedRecordId = insRes.rows[0].expense_id;
+
+        importedRefundsCount++;
+        totalRefundAmount += item.amount;
+        totalExpenseAmount -= item.amount; // offsets expenses
+        categoryCounts['Refunds & Reversals'] = (categoryCounts['Refunds & Reversals'] || 0) + 1;
+      } else if (isDebit) {
+        // NORMAL EXPENSE DEBIT
         let catId = item.categoryId;
         if (!catId) {
-          const fallback = await findFallbackCategory(client, type);
+          const fallback = await findFallbackCategory(client, 'expense');
           catId = fallback?.category_id;
         }
 
-        // Insert into core financial tables
-        let insertedRecordId = null;
-        if (isDebit) {
-          const insRes = await client.query(
-            `INSERT INTO public.expenses (user_id, category_id, amount, expense_date, description)
-             VALUES ($1, $2, $3, $4, $5) RETURNING expense_id`,
-            [userId, catId, item.amount, item.transactionDate, item.description]
-          );
-          insertedRecordId = insRes.rows[0].expense_id;
-          importedExpensesCount++;
-          totalExpenseAmount += item.amount;
-        } else {
-          const insRes = await client.query(
-            `INSERT INTO public.transactions (user_id, category_id, amount, type, description, transaction_date)
-             VALUES ($1, $2, $3, 'income', $4, $5) RETURNING transaction_id`,
-            [userId, catId, item.amount, item.description, item.transactionDate]
-          );
-          insertedRecordId = insRes.rows[0].transaction_id;
-          importedIncomeCount++;
-          totalIncomeAmount += item.amount;
+        const insRes = await client.query(
+          `INSERT INTO public.expenses (user_id, category_id, amount, expense_date, description)
+           VALUES ($1, $2, $3, $4, $5) RETURNING expense_id`,
+          [userId, catId, item.amount, item.transactionDate, item.description]
+        );
+        insertedRecordId = insRes.rows[0].expense_id;
+        importedExpensesCount++;
+        totalExpenseAmount += item.amount;
+        categoryCounts[item.categoryName] = (categoryCounts[item.categoryName] || 0) + 1;
+      } else {
+        // NORMAL INCOME CREDIT
+        let catId = item.categoryId;
+        if (!catId) {
+          const fallback = await findFallbackCategory(client, 'income');
+          catId = fallback?.category_id;
         }
 
-        // Track category stats
+        const insRes = await client.query(
+          `INSERT INTO public.transactions (user_id, category_id, amount, type, description, transaction_date)
+           VALUES ($1, $2, $3, 'income', $4, $5) RETURNING transaction_id`,
+          [userId, catId, item.amount, item.description, item.transactionDate]
+        );
+        insertedRecordId = insRes.rows[0].transaction_id;
+        importedIncomeCount++;
+        totalIncomeAmount += item.amount;
         categoryCounts[item.categoryName] = (categoryCounts[item.categoryName] || 0) + 1;
-
-        // Record fingerprint claim
-        try {
-          await client.query(
-            `INSERT INTO public.transaction_import_fingerprints (user_id, fingerprint, source, transaction_type, record_id)
-             VALUES ($1, $2, 'csv', $3, $4)
-             ON CONFLICT (user_id, fingerprint) DO NOTHING`,
-            [userId, item.fingerprint, type, insertedRecordId]
-          );
-        } catch (e) {}
-
-        // Record in autotrack_events ledger
-        try {
-          await client.query(
-            `INSERT INTO public.autotrack_events
-              (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, imported_into, record_id, review_note)
-             VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'approved', $9, $10, $11)
-             ON CONFLICT (user_id, fingerprint) DO NOTHING`,
-            [
-              userId,
-              webDeviceId,
-              item.fingerprint,
-              item.amount,
-              item.direction,
-              item.transactionDate,
-              item.merchant,
-              item.reference,
-              type,
-              insertedRecordId,
-              `Imported automatically from ${parsedStatement.formatName}`
-            ]
-          );
-        } catch (e) {}
       }
 
-      // Record duplicate rows in autotrack ledger for visibility
-      for (const dup of parsedStatement.duplicateRows) {
-        try {
-          await client.query(
-            `INSERT INTO public.autotrack_events
-              (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, review_note)
-             VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'duplicate', 'Duplicate skipped: already present in records.')
-             ON CONFLICT (user_id, fingerprint) DO NOTHING`,
-            [userId, webDeviceId, dup.fingerprint, dup.amount, dup.direction, dup.transactionDate, dup.merchant, dup.reference]
-          );
-        } catch (e) {}
-      }
+      // Update fingerprint with record_id
+      await client.query(
+        'UPDATE public.transaction_import_fingerprints SET record_id = $1 WHERE import_id = $2',
+        [insertedRecordId, importId]
+      );
 
-      // Record skipped failed status rows (e.g. status was FAILURE)
-      for (const failedItem of parsedStatement.skippedFailedRows) {
-        try {
-          const fakeFp = sha256(`failed|${userId}|${rowNumber}|${Date.now()}|${Math.random()}`);
-          await client.query(
-            `INSERT INTO public.autotrack_events
-              (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, review_note)
-             VALUES ($1, $2, 'csv_statement', $3, 0, 'INR', 'debit', CURRENT_DATE, 'Failed Transaction', null, 'rejected', $4)
-             ON CONFLICT DO NOTHING`,
-            [userId, webDeviceId, fakeFp, failedItem.reason]
-          );
-        } catch (e) {}
-      }
-
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
-      throw err;
-    } finally {
-      client.release();
+      // Record approved event in autotrack_events
+      await client.query(
+        `INSERT INTO public.autotrack_events
+          (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, imported_into, record_id, review_note)
+         VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'approved', $9, $10, $11)
+         ON CONFLICT (user_id, fingerprint) DO UPDATE
+           SET status = 'approved', imported_into = EXCLUDED.imported_into, record_id = EXCLUDED.record_id, review_note = EXCLUDED.review_note`,
+        [
+          userId,
+          webDeviceId,
+          item.fingerprint,
+          item.amount,
+          item.direction,
+          item.transactionDate,
+          item.merchant,
+          item.reference,
+          type,
+          insertedRecordId,
+          isRefund ? 'Refund / Reversal: offset against expenses' : `Imported automatically from ${parsedStatement.formatName}`
+        ]
+      );
     }
+
+    // Record in-batch duplicate rows
+    for (const dup of parsedStatement.duplicateRows) {
+      duplicateCount++;
+      await client.query(
+        `INSERT INTO public.autotrack_events
+          (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, review_note)
+         VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'duplicate', 'Duplicate skipped: already present in records.')
+         ON CONFLICT (user_id, fingerprint) DO NOTHING`,
+        [userId, webDeviceId, dup.fingerprint, dup.amount, dup.direction, dup.transactionDate, dup.merchant, dup.reference]
+      );
+    }
+
+    // Record skipped failed status rows (using actual source row number!)
+    for (const failedItem of parsedStatement.skippedFailedRows) {
+      const failedFp = sha256(`failed|${userId}|${failedItem.rowNumber}|${failedItem.reason}`);
+      await client.query(
+        `INSERT INTO public.autotrack_events
+          (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, review_note)
+         VALUES ($1, $2, 'csv_statement', $3, 0.01, 'INR', 'debit', CURRENT_DATE, 'Failed Transaction', null, 'rejected', $4)
+         ON CONFLICT (user_id, fingerprint) DO NOTHING`,
+        [userId, webDeviceId, failedFp, `Row ${failedItem.rowNumber}: ${failedItem.reason}`]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    const totalImported = importedExpensesCount + importedIncomeCount + importedRefundsCount;
 
     res.json({
       success: true,
       isRecognized: true,
       formatDetected: parsedStatement.formatName,
       totalRows: parsedStatement.totalRows,
-      importedCount: parsedStatement.successfulRows.length,
-      duplicateCount: parsedStatement.duplicateRows.length,
+      importedCount: totalImported,
+      duplicateCount,
       failedCount: parsedStatement.skippedFailedRows.length,
       invalidCount: parsedStatement.invalidRows.length,
       importedExpensesCount,
       importedIncomeCount,
+      importedRefundsCount,
       totalExpenseAmount: parseFloat(totalExpenseAmount.toFixed(2)),
       totalIncomeAmount: parseFloat(totalIncomeAmount.toFixed(2)),
+      totalRefundAmount: parseFloat(totalRefundAmount.toFixed(2)),
       categoryBreakdown: categoryCounts,
       sampleImported: parsedStatement.successfulRows.slice(0, 5),
-      message: `Successfully processed statement! Imported ${parsedStatement.successfulRows.length} transactions (${parsedStatement.duplicateRows.length} duplicates and ${parsedStatement.skippedFailedRows.length} non-successful entries skipped).`,
+      message: `Successfully processed statement! Imported ${totalImported} transactions (${duplicateCount} duplicates and ${parsedStatement.skippedFailedRows.length} non-successful entries skipped).`,
     });
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
     next(error);
+  } finally {
+    client.release();
   }
 });
 
 /* ==========================================================================
-   LEGACY & MANUAL MAPPING ENDPOINTS (RETAINED FOR CUSTOM/EDGE CASES)
+   LEGACY & MANUAL MAPPING ENDPOINTS (RETAINED)
    ========================================================================== */
 
 router.post('/csv/inspect', authenticateToken, async (req, res, next) => {
@@ -379,15 +443,11 @@ router.post('/csv/preview', authenticateToken, async (req, res, next) => {
     const catResult = await query(`SELECT category_id, category_name, category_type FROM public.categories`);
     const dbCategories = catResult.rows;
 
-    const existingFingerprints = new Set();
-    try {
-      const [claimedFp, eventFp] = await Promise.all([
-        query('SELECT fingerprint FROM public.transaction_import_fingerprints WHERE user_id = $1', [userId]),
-        query("SELECT fingerprint FROM public.autotrack_events WHERE user_id = $1 AND status != 'rejected'", [userId]),
-      ]);
-      claimedFp.rows.forEach(r => existingFingerprints.add(r.fingerprint));
-      eventFp.rows.forEach(r => existingFingerprints.add(r.fingerprint));
-    } catch (err) {}
+    const claimedFp = await query(
+      'SELECT fingerprint FROM public.transaction_import_fingerprints WHERE user_id = $1',
+      [userId]
+    );
+    const existingFingerprints = new Set(claimedFp.rows.map(r => r.fingerprint));
 
     const parseResult = parseAndNormalizeStatement(csvText, {
       userId,
@@ -443,19 +503,20 @@ router.post('/csv/import', authenticateToken, async (req, res, next) => {
 
       const fingerprint = item.fingerprint || sha256(`${userId}|${item.transactionDate}|${Number(item.amount).toFixed(2)}|${item.direction}|${item.reference || item.merchant?.toLowerCase()}`);
 
-      let isDuplicate = false;
-      try {
-        const check = await client.query(
-          `SELECT import_id FROM public.transaction_import_fingerprints WHERE user_id = $1 AND fingerprint = $2`,
-          [userId, fingerprint]
-        );
-        if (check.rowCount > 0) isDuplicate = true;
-      } catch (e) {}
+      const claim = await client.query(
+        `INSERT INTO public.transaction_import_fingerprints (user_id, fingerprint, source, transaction_type)
+         VALUES ($1, $2, 'csv', $3)
+         ON CONFLICT (user_id, fingerprint) DO NOTHING
+         RETURNING import_id`,
+        [userId, fingerprint, item.direction === 'debit' ? 'expense' : 'income']
+      );
 
-      if (isDuplicate) {
+      if (claim.rowCount === 0) {
         summary.duplicates++;
         continue;
       }
+
+      const importId = claim.rows[0].import_id;
 
       if (importMode === 'direct') {
         const categoryId = item.categoryId || (item.direction === 'debit' ? defaultExpenseCategoryId : defaultIncomeCategoryId);
@@ -478,16 +539,18 @@ router.post('/csv/import', authenticateToken, async (req, res, next) => {
           summary.duplicates++;
         } else {
           summary.imported++;
-          try {
-            await client.query(
-              `INSERT INTO public.autotrack_events
-                (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, imported_into, record_id, review_note)
-               VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'approved', $9, $10, 'Imported from CSV statement.')
-               ON CONFLICT (user_id, fingerprint) DO UPDATE
-                 SET status = 'approved', imported_into = EXCLUDED.imported_into, record_id = EXCLUDED.record_id`,
-              [userId, webDeviceId, fingerprint, item.amount, item.direction, item.transactionDate, item.merchant, item.reference, result.type, result.recordId]
-            );
-          } catch (e) {}
+          await client.query(
+            'UPDATE public.transaction_import_fingerprints SET record_id = $1 WHERE import_id = $2',
+            [result.recordId, importId]
+          );
+          await client.query(
+            `INSERT INTO public.autotrack_events
+              (user_id, device_id, source_app, fingerprint, amount, currency, direction, transaction_date, merchant, reference, status, imported_into, record_id, review_note)
+             VALUES ($1, $2, 'csv_statement', $3, $4, 'INR', $5, $6, $7, $8, 'approved', $9, $10, 'Imported from CSV statement.')
+             ON CONFLICT (user_id, fingerprint) DO UPDATE
+               SET status = 'approved', imported_into = EXCLUDED.imported_into, record_id = EXCLUDED.record_id`,
+            [userId, webDeviceId, fingerprint, item.amount, item.direction, item.transactionDate, item.merchant, item.reference, result.type, result.recordId]
+          );
         }
       } else {
         const inserted = await client.query(

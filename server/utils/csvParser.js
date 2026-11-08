@@ -97,7 +97,6 @@ export function findHeaderRowIndex(rows) {
       HEADER_KEYWORDS.some(kw => cell.includes(kw))
     ).length;
 
-    // Header requires at least 2 distinct banking/UPI keyword matches
     if (matchCount >= 2) {
       return i;
     }
@@ -232,7 +231,7 @@ export function detectStatementFormat(headers) {
 }
 
 /**
- * Intelligent Column Mapping for Custom / Fallback Formats
+ * Column mapping guesser for unstructured or arbitrary CSVs
  */
 export function guessColumnMapping(headers) {
   const mapping = {
@@ -287,11 +286,10 @@ export function cleanUpiEntity(raw) {
   if (!raw) return 'Unknown Party';
   const str = String(raw).trim();
 
-  // 1. Check parenthesized name, e.g. "xxxxx09933@ybl(NARAYANA BHIMA)" -> "NARAYANA BHIMA"
+  // 1. Check parenthesized name, e.g. "user@ybl(NAME)" -> "NAME"
   const parenMatch = str.match(/\(([^)]+)\)/);
   if (parenMatch && parenMatch[1].trim()) {
     const inside = parenMatch[1].trim();
-    // If not all masked 'xxxx'
     if (!/^x+$/i.test(inside.replace(/[^a-zA-Z0-9]/g, ''))) {
       return inside;
     }
@@ -306,7 +304,6 @@ export function cleanUpiEntity(raw) {
     }
   }
 
-  // 3. Fallback to inside parentheses or cleaned string
   if (parenMatch && parenMatch[1].trim()) return parenMatch[1].trim();
   return str.split('@')[0] || str;
 }
@@ -316,7 +313,7 @@ export function cleanUpiEntity(raw) {
  * Rejects failed, declined, cancelled, or pending transactions.
  */
 export function isSuccessfulStatus(statusRaw) {
-  if (!statusRaw || typeof statusRaw !== 'string') return true; // Default to true if statement doesn't have status column (bank ledger)
+  if (!statusRaw || typeof statusRaw !== 'string') return true;
   const s = statusRaw.trim().toUpperCase();
   if (s === 'SUCCESS' || s === 'SUCCESSFUL' || s === 'COMPLETED' || s === 'PAID' || s === 'DONE' || s === 'EXECUTED' || s === 'PROCESSED' || s === 'CLEARED') {
     return true;
@@ -325,7 +322,16 @@ export function isSuccessfulStatus(statusRaw) {
 }
 
 /**
- * Cleans numerical amount string (removes ₹, Rs., INR, commas, whitespace)
+ * Detects whether a transaction is a refund or reversal.
+ */
+export function isRefundOrReversal(text) {
+  if (!text || typeof text !== 'string') return false;
+  const str = text.toLowerCase();
+  return /\b(refund|reversal|reversed|chargeback|return of|dispute credit|rfd)\b/i.test(str);
+}
+
+/**
+ * Cleans numerical amount string (removes currency symbols, commas, whitespace)
  */
 export function cleanAmount(val) {
   if (val === null || val === undefined) return null;
@@ -413,7 +419,6 @@ export function parseDateString(raw, formatHint = 'auto') {
       if (isValidDate(y, first, second)) return formatDate(y, first, second);
     }
 
-    // Default for Indian & global banking is DD/MM/YYYY
     if (isValidDate(y, second, first)) {
       return formatDate(y, second, first);
     }
@@ -438,8 +443,7 @@ function formatDate(y, m, d) {
 }
 
 /**
- * Smart Auto-Categorization Engine
- * Maps transaction keywords against categories present in the database.
+ * Category Keyword Dictionaries
  */
 const CATEGORY_KEYWORDS = {
   expense: [
@@ -540,7 +544,7 @@ const CATEGORY_KEYWORDS = {
     },
     {
       category: 'Bonus',
-      keywords: ['bonus', 'reward', 'cashback', 'incentive', 'refund', 'reversal']
+      keywords: ['bonus', 'reward', 'cashback', 'incentive']
     },
     {
       category: 'Business',
@@ -549,16 +553,33 @@ const CATEGORY_KEYWORDS = {
   ]
 };
 
-export function autoCategorize(text, direction, dbCategories) {
+/**
+ * Auto-categorization engine with refund protection.
+ * If transaction is a refund/reversal, returns 'Refunds & Reversals' expense category.
+ */
+export function autoCategorize(text, direction, dbCategories, isRefund = false) {
+  // If flagged as refund or reversal, map strictly to Refunds & Reversals under expense
+  if (isRefund) {
+    const refundCat = dbCategories.find(c =>
+      c.category_type === 'expense' && c.category_name.toLowerCase().includes('refund')
+    ) || dbCategories.find(c =>
+      c.category_type === 'expense' && c.category_name.toLowerCase().includes('other expense')
+    ) || dbCategories.find(c => c.category_type === 'expense');
+
+    return {
+      categoryId: refundCat?.category_id || null,
+      categoryName: refundCat?.category_name || 'Refunds & Reversals',
+      matchedKeyword: 'refund',
+    };
+  }
+
   const normText = (text || '').toLowerCase();
   const type = direction === 'debit' ? 'expense' : 'income';
   const rules = CATEGORY_KEYWORDS[type] || [];
 
-  // Match against keywords
   for (const rule of rules) {
     for (const kw of rule.keywords) {
       if (normText.includes(kw)) {
-        // Find category_id in user's DB categories
         const matchedDbCat = dbCategories.find(c =>
           c.category_type === type && c.category_name.toLowerCase() === rule.category.toLowerCase()
         );
@@ -573,7 +594,6 @@ export function autoCategorize(text, direction, dbCategories) {
     }
   }
 
-  // Fallback to "Other Expense" or "Other Income"
   const fallbackName = type === 'expense' ? 'other expense' : 'other income';
   const fallbackCat = dbCategories.find(c =>
     c.category_type === type && c.category_name.toLowerCase() === fallbackName
@@ -588,7 +608,7 @@ export function autoCategorize(text, direction, dbCategories) {
 
 /**
  * Universal Statement Parser & Normalizer
- * Handles both automated one-click ingestion and manual mapping fallbacks.
+ * Handles automated ingestion, refund detection, deduplication, and error reporting.
  */
 export function parseAndNormalizeStatement(csvText, options = {}) {
   const { userId, categories = [], existingFingerprints = new Set(), customMapping = null } = options;
@@ -614,12 +634,11 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
     const row = rows[idx];
     const rowNumber = idx + 1;
 
-    // Skip empty lines
     if (!row || row.every(c => !c || c.trim().length === 0)) {
       continue;
     }
 
-    // 1. Status Check (UPI status: SUCCESS, FAILURE, etc.)
+    // 1. Status Check (SUCCESS vs. FAILURE / DECLINED)
     const rawStatus = activeMapping.statusCol >= 0 && activeMapping.statusCol < row.length
       ? row[activeMapping.statusCol]
       : null;
@@ -666,7 +685,7 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
       }
     }
 
-    // B. Amount with DR/CR or Type column (e.g. UPI Unified Statement)
+    // B. Amount with DR/CR or Type column
     if (amount === null && activeMapping.amountCol >= 0 && activeMapping.amountCol < row.length) {
       const amtParsed = cleanAmount(row[activeMapping.amountCol]);
       if (amtParsed && amtParsed.value > 0) {
@@ -704,23 +723,25 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
       continue;
     }
 
-    // 4. Counterparty & Merchant Extraction
+    // 4. Counterparty & Narration Extraction
     let counterparty = '';
     let bankName = '';
     let rawReference = '';
+    let fullContextText = '';
 
     if (formatInfo.formatId === 'upi_unified') {
       const sender = activeMapping.senderCol >= 0 ? row[activeMapping.senderCol] : '';
       const receiver = activeMapping.receiverCol >= 0 ? row[activeMapping.receiverCol] : '';
       bankName = activeMapping.bankCol >= 0 ? row[activeMapping.bankCol] : '';
       rawReference = activeMapping.refCol >= 0 ? row[activeMapping.refCol] : '';
+      fullContextText = `${sender} ${receiver} ${row.join(' ')}`;
 
-      // If user is paying (DR), counterparty is Receiver; if user is receiving (CR), counterparty is Sender
       counterparty = direction === 'debit' ? cleanUpiEntity(receiver) : cleanUpiEntity(sender);
     } else {
       const rawDesc = activeMapping.descCol >= 0 ? row[activeMapping.descCol] : '';
       rawReference = activeMapping.refCol >= 0 ? row[activeMapping.refCol] : '';
       counterparty = cleanUpiEntity(rawDesc);
+      fullContextText = `${rawDesc} ${row.join(' ')}`;
     }
 
     // Reference / UTR
@@ -731,9 +752,14 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
       if (upiRefMatch) reference = upiRefMatch[1];
     }
 
-    // Clean description for database
+    // Check if this transaction is a refund or reversal
+    const isRefund = isRefundOrReversal(fullContextText);
+
     const cleanMerchant = (counterparty || 'UPI Transaction').slice(0, 180);
-    const cleanDescription = `${direction === 'debit' ? 'Payment to' : 'Payment from'} ${cleanMerchant}${bankName ? ` (${bankName})` : ''}${reference ? ` - Ref: ${reference}` : ''}`.slice(0, 240);
+    const prefix = isRefund
+      ? '[Refund]'
+      : (direction === 'debit' ? 'Payment to' : 'Payment from');
+    const cleanDescription = `${prefix} ${cleanMerchant}${bankName ? ` (${bankName})` : ''}${reference ? ` - Ref: ${reference}` : ''}`.slice(0, 240);
 
     // 5. Deterministic SHA-256 Fingerprint
     const identityString = `${userId || 'web'}|${parsedDate}|${amount.toFixed(2)}|${direction}|${reference || cleanMerchant.toLowerCase()}`;
@@ -743,8 +769,8 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
     const isDuplicate = existingFingerprints.has(fingerprint) || seenBatchFingerprints.has(fingerprint);
     seenBatchFingerprints.add(fingerprint);
 
-    // 7. Auto-Categorization
-    const categoryResult = autoCategorize(`${cleanMerchant} ${cleanDescription}`, direction, categories);
+    // 7. Auto-Categorization (respecting refund flag)
+    const categoryResult = autoCategorize(`${cleanMerchant} ${cleanDescription}`, direction, categories, isRefund);
 
     const transactionItem = {
       rowNumber,
@@ -752,6 +778,7 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
       amount: Number(amount.toFixed(2)),
       currency: 'INR',
       direction, // 'debit' or 'credit'
+      isRefund,
       merchant: cleanMerchant,
       description: cleanDescription,
       reference,
@@ -784,7 +811,6 @@ export function parseAndNormalizeStatement(csvText, options = {}) {
   };
 }
 
-// Keep legacy helper for compatibility with tests
 export function parseStatementRows(rawRows, mapping, options = {}) {
   const dummyCsv = rawRows.map(r => r.join(',')).join('\n');
   const res = parseAndNormalizeStatement(dummyCsv, {

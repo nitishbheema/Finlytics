@@ -129,7 +129,7 @@ async function runRouteTests() {
     );
 
     const upiSample = `Date,Time,Bank Name,Account Number,Sender,Receiver,Payment ID/Reference Number,Pay/Collect,Amount (in Rs.),DR/CR,Status
-08/11/2026,10:20:24,UNION BANK OF INDIA,XXXX0189,test@upi(User),swiggy@icici(Swiggy),102024302967,PAY,450,DR,SUCCESS`;
+08/11/2026,10:20:24,DEMO BANK,XXXX1234,user@upi(Demo User),merchant@icici(Demo Store),SYNTH999888777111,PAY,450,DR,SUCCESS`;
 
     const inspectUpiRes = await fetch(`${baseUrl}/api/autotrack/csv/inspect`, {
       method: 'POST',
