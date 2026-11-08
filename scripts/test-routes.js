@@ -51,7 +51,7 @@ async function runRouteTests() {
     });
     assert(loginRes.status === 400, 'POST /api/auth/login validates required credentials');
 
-    // 4. Protected route without token
+    // 4. Protected routes without token
     const dashRes = await fetch(`${baseUrl}/api/dashboard/summary`);
     assert(dashRes.status === 401, 'GET /api/dashboard/summary rejects unauthenticated requests with 401');
 
@@ -66,6 +66,19 @@ async function runRouteTests() {
 
     const profRes = await fetch(`${baseUrl}/api/user/profile`, { method: 'PUT' });
     assert(profRes.status === 401, 'PUT /api/user/profile rejects unauthenticated requests with 401');
+
+    // AutoTrack unauthenticated tests
+    const atSummaryRes = await fetch(`${baseUrl}/api/autotrack/summary`);
+    assert(atSummaryRes.status === 401, 'GET /api/autotrack/summary rejects unauthenticated requests with 401');
+
+    const atInspectUnauth = await fetch(`${baseUrl}/api/autotrack/csv/inspect`, { method: 'POST' });
+    assert(atInspectUnauth.status === 401, 'POST /api/autotrack/csv/inspect rejects unauthenticated requests with 401');
+
+    const atPreviewUnauth = await fetch(`${baseUrl}/api/autotrack/csv/preview`, { method: 'POST' });
+    assert(atPreviewUnauth.status === 401, 'POST /api/autotrack/csv/preview rejects unauthenticated requests with 401');
+
+    const atImportUnauth = await fetch(`${baseUrl}/api/autotrack/csv/import`, { method: 'POST' });
+    assert(atImportUnauth.status === 401, 'POST /api/autotrack/csv/import rejects unauthenticated requests with 401');
 
     // 5. Category Type Validation Tests (Invalid Type should return 400)
     const badCatRes = await fetch(`${baseUrl}/api/categories`, {
@@ -82,7 +95,58 @@ async function runRouteTests() {
     });
     assert(emptyCatRes.status === 400, 'POST /api/categories rejects empty category name');
 
-    // 6. 404 handler
+    // 6. AutoTrack CSV Inspect & Preview Tests
+    const inspectEmptyRes = await fetch(`${baseUrl}/api/autotrack/csv/inspect`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ csvText: '' }),
+    });
+    assert(inspectEmptyRes.status === 400, 'POST /api/autotrack/csv/inspect rejects empty CSV content');
+
+    const sampleCsv = `Date,Description,Debit,Credit,Balance
+15/04/2026,Swiggy Order,350.00,,12000.00
+16/04/2026,Salary Transfer,,80000.00,92000.00`;
+
+    const inspectSuccessRes = await fetch(`${baseUrl}/api/autotrack/csv/inspect`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ csvText: sampleCsv }),
+    });
+    const inspectData = await inspectSuccessRes.json();
+    assert(
+      inspectSuccessRes.status === 200 && inspectData.headers.length === 5 && inspectData.suggestedMapping.debitCol === 2,
+      'POST /api/autotrack/csv/inspect parses headers and suggests column mappings'
+    );
+
+    const previewEmptyRes = await fetch(`${baseUrl}/api/autotrack/csv/preview`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ csvText: '' }),
+    });
+    assert(previewEmptyRes.status === 400, 'POST /api/autotrack/csv/preview rejects empty CSV content');
+
+    const importEmptyRes = await fetch(`${baseUrl}/api/autotrack/csv/import`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ transactions: [] }),
+    });
+    assert(importEmptyRes.status === 400, 'POST /api/autotrack/csv/import rejects empty transaction array');
+
+    const badSettingsRes = await fetch(`${baseUrl}/api/autotrack/settings`, {
+      method: 'PUT',
+      headers: authHeaders,
+      body: JSON.stringify({ autoImportEnabled: 'not-a-boolean' }),
+    });
+    assert(badSettingsRes.status === 400, 'PUT /api/autotrack/settings rejects non-boolean settings');
+
+    const badApproveRes = await fetch(`${baseUrl}/api/autotrack/events/invalid-event-id/approve`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({}),
+    });
+    assert(badApproveRes.status === 400, 'POST /api/autotrack/events/:id/approve rejects non-numeric event ID');
+
+    // 7. 404 handler
     const notFoundRes = await fetch(`${baseUrl}/api/nonexistent-route-12345`);
     assert(notFoundRes.status === 404, 'Unmatched /api/* route returns 404 Not Found');
 
@@ -99,6 +163,6 @@ async function runRouteTests() {
 }
 
 runRouteTests().catch((err) => {
-  console.error('Route testing failed:', err);
+  console.error('Test runner encountered an error:', err);
   process.exit(1);
 });

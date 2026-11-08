@@ -7,6 +7,7 @@ import expenseRoutes from './routes/expenses.js';
 import incomeRoutes from './routes/income.js';
 import categoryRoutes from './routes/categories.js';
 import userRoutes from './routes/user.js';
+import autoTrackRoutes from './routes/autotrack.js';
 import { errorHandler } from './middleware/errorHandler.js';
 
 const app = express();
@@ -59,6 +60,7 @@ app.use('/api/expenses', expenseRoutes);
 app.use('/api/income', incomeRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api/user', userRoutes);
+app.use('/api/autotrack', autoTrackRoutes);
 
 // 404 for unmatched API routes
 app.all('/api/*', (req, res) => {
