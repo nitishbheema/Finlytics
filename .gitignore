@@ -21,10 +21,11 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local uploads and logs
+# Local uploads, logs and CSV statement data (NEVER COMMIT PERSONAL STATEMENTS)
 uploads/*
 !uploads/.gitkeep
 *.log
+*.csv
 
 # Vercel
 .vercel

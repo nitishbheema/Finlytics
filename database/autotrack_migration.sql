@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS public.autotrack_events (
 CREATE INDEX IF NOT EXISTS idx_autotrack_events_user_status_date
   ON public.autotrack_events(user_id, status, transaction_date DESC);
 
--- Allow web-only statement imports without requiring a paired device
+-- Allow web-only statement imports without requiring a paired hardware device
 ALTER TABLE public.autotrack_events ALTER COLUMN device_id DROP NOT NULL;
 ALTER TABLE public.autotrack_events ADD COLUMN IF NOT EXISTS review_note VARCHAR(240);
 ALTER TABLE public.autotrack_events DROP CONSTRAINT IF EXISTS autotrack_events_status_check;
@@ -86,8 +86,21 @@ ALTER TABLE public.autotrack_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.autotrack_settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.transaction_import_fingerprints ENABLE ROW LEVEL SECURITY;
 
-REVOKE ALL ON TABLE public.autotrack_devices FROM anon, authenticated;
-REVOKE ALL ON TABLE public.autotrack_pairing_codes FROM anon, authenticated;
-REVOKE ALL ON TABLE public.autotrack_events FROM anon, authenticated;
-REVOKE ALL ON TABLE public.autotrack_settings FROM anon, authenticated;
-REVOKE ALL ON TABLE public.transaction_import_fingerprints FROM anon, authenticated;
+-- Conditional revoke for Supabase roles (works seamlessly on Supabase and standard PostgreSQL)
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    REVOKE ALL ON TABLE public.autotrack_devices FROM anon;
+    REVOKE ALL ON TABLE public.autotrack_pairing_codes FROM anon;
+    REVOKE ALL ON TABLE public.autotrack_events FROM anon;
+    REVOKE ALL ON TABLE public.autotrack_settings FROM anon;
+    REVOKE ALL ON TABLE public.transaction_import_fingerprints FROM anon;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    REVOKE ALL ON TABLE public.autotrack_devices FROM authenticated;
+    REVOKE ALL ON TABLE public.autotrack_pairing_codes FROM authenticated;
+    REVOKE ALL ON TABLE public.autotrack_events FROM authenticated;
+    REVOKE ALL ON TABLE public.autotrack_settings FROM authenticated;
+    REVOKE ALL ON TABLE public.transaction_import_fingerprints FROM authenticated;
+  END IF;
+END $$;

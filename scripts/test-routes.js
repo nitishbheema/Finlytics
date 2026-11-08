@@ -71,6 +71,9 @@ async function runRouteTests() {
     const atSummaryRes = await fetch(`${baseUrl}/api/autotrack/summary`);
     assert(atSummaryRes.status === 401, 'GET /api/autotrack/summary rejects unauthenticated requests with 401');
 
+    const atAutoImportUnauth = await fetch(`${baseUrl}/api/autotrack/csv/auto-import`, { method: 'POST' });
+    assert(atAutoImportUnauth.status === 401, 'POST /api/autotrack/csv/auto-import rejects unauthenticated requests with 401');
+
     const atInspectUnauth = await fetch(`${baseUrl}/api/autotrack/csv/inspect`, { method: 'POST' });
     assert(atInspectUnauth.status === 401, 'POST /api/autotrack/csv/inspect rejects unauthenticated requests with 401');
 
@@ -95,7 +98,14 @@ async function runRouteTests() {
     });
     assert(emptyCatRes.status === 400, 'POST /api/categories rejects empty category name');
 
-    // 6. AutoTrack CSV Inspect & Preview Tests
+    // 6. AutoTrack Auto-Import & Inspection Tests
+    const autoImportEmpty = await fetch(`${baseUrl}/api/autotrack/csv/auto-import`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ csvText: '' }),
+    });
+    assert(autoImportEmpty.status === 400, 'POST /api/autotrack/csv/auto-import rejects empty CSV content');
+
     const inspectEmptyRes = await fetch(`${baseUrl}/api/autotrack/csv/inspect`, {
       method: 'POST',
       headers: authHeaders,
@@ -114,8 +124,22 @@ async function runRouteTests() {
     });
     const inspectData = await inspectSuccessRes.json();
     assert(
-      inspectSuccessRes.status === 200 && inspectData.headers.length === 5 && inspectData.suggestedMapping.debitCol === 2,
-      'POST /api/autotrack/csv/inspect parses headers and suggests column mappings'
+      inspectSuccessRes.status === 200 && inspectData.headers.length === 5 && inspectData.isRecognized === true,
+      'POST /api/autotrack/csv/inspect automatically recognizes bank statement format'
+    );
+
+    const upiSample = `Date,Time,Bank Name,Account Number,Sender,Receiver,Payment ID/Reference Number,Pay/Collect,Amount (in Rs.),DR/CR,Status
+08/11/2026,10:20:24,DEMO BANK,XXXX1234,user@upi(Demo User),merchant@icici(Demo Store),SYNTH999888777111,PAY,450,DR,SUCCESS`;
+
+    const inspectUpiRes = await fetch(`${baseUrl}/api/autotrack/csv/inspect`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ csvText: upiSample }),
+    });
+    const inspectUpiData = await inspectUpiRes.json();
+    assert(
+      inspectUpiRes.status === 200 && inspectUpiData.formatDetected.includes('UPI Unified'),
+      'POST /api/autotrack/csv/inspect automatically recognizes UPI Unified statement'
     );
 
     const previewEmptyRes = await fetch(`${baseUrl}/api/autotrack/csv/preview`, {

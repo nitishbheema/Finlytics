@@ -12,6 +12,7 @@ INSERT INTO categories (category_name, category_type) VALUES
     ('Utilities', 'expense'),
     ('Healthcare', 'expense'),
     ('Education', 'expense'),
+    ('Refunds & Reversals', 'expense'),
     ('Other Expense', 'expense')
 ON CONFLICT (category_name, category_type) DO NOTHING;
 

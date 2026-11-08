@@ -60,6 +60,7 @@ router.get('/summary', authenticateToken, async (req, res, next) => {
        JOIN categories c ON e.category_id = c.category_id
        WHERE e.user_id = $1
        GROUP BY c.category_name
+       HAVING SUM(e.amount) > 0
        ORDER BY total DESC
        LIMIT 1`,
       [uid]
@@ -138,6 +139,7 @@ router.get('/charts', authenticateToken, async (req, res, next) => {
        JOIN categories c ON e.category_id = c.category_id
        WHERE e.user_id = $1
        GROUP BY c.category_name
+       HAVING SUM(e.amount) > 0
        ORDER BY total DESC`,
       [uid]
     );

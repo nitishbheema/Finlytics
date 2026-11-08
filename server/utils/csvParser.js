@@ -1,15 +1,10 @@
 import crypto from 'node:crypto';
 
 /**
- * Robust CSV parser that handles:
- * - Common delimiters (comma, semicolon, tab)
- * - Quoted fields with escaped quotes and embedded commas/newlines
- * - Leading/trailing spaces
- * - Bank statement preambles (skipping non-tabular header metadata)
+ * Universal Delimiter Detection (Comma, Semicolon, Tab)
  */
-
 export function detectDelimiter(text) {
-  const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0).slice(0, 10);
+  const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0).slice(0, 15);
   if (lines.length === 0) return ',';
 
   const counts = { ',': 0, ';': 0, '\t': 0 };
@@ -25,8 +20,7 @@ export function detectDelimiter(text) {
 }
 
 /**
- * Parse raw CSV text into array of rows (each row is array of string cells)
- * adhering to RFC 4180 rules.
+ * RFC 4180 Compliant CSV Parser
  */
 export function parseCSV(text, delimiter = ',') {
   const rows = [];
@@ -63,7 +57,6 @@ export function parseCSV(text, delimiter = ',') {
         i++;
       }
       currentRow.push(currentCell.trim());
-      // Only add non-empty rows or rows with more than one empty cell
       if (currentRow.some(cell => cell.length > 0)) {
         rows.push(currentRow);
       }
@@ -77,7 +70,6 @@ export function parseCSV(text, delimiter = ',') {
     i++;
   }
 
-  // Push final cell/row if remaining
   if (currentCell.length > 0 || currentRow.length > 0) {
     currentRow.push(currentCell.trim());
     if (currentRow.some(cell => cell.length > 0)) {
@@ -89,33 +81,157 @@ export function parseCSV(text, delimiter = ',') {
 }
 
 /**
- * Scan rows to find the actual table header row.
- * Bank statements frequently start with 2-10 rows of account/branch details.
+ * Header row detector. Scans past metadata/preambles (e.g. Customer Mobile Number, Title lines).
  */
 const HEADER_KEYWORDS = [
-  'date', 'txn date', 'transaction date', 'value date', 'posting date',
-  'description', 'narration', 'particulars', 'remarks', 'details', 'payee',
-  'debit', 'withdrawal', 'dr', 'credit', 'deposit', 'cr', 'amount',
-  'balance', 'chq', 'ref', 'utr', 'reference'
+  'date', 'time', 'sender', 'receiver', 'payment id', 'pay/collect',
+  'dr/cr', 'status', 'narration', 'description', 'particulars',
+  'debit', 'credit', 'withdrawal', 'deposit', 'amount', 'balance',
+  'ref', 'utr', 'transaction id', 'chq', 'activity', 'wallet txn id'
 ];
 
 export function findHeaderRowIndex(rows) {
   for (let i = 0; i < Math.min(rows.length, 25); i++) {
-    const row = rows[i].map(c => c.toLowerCase().trim());
+    const row = rows[i].map(c => (c || '').toLowerCase().trim());
     const matchCount = row.filter(cell =>
       HEADER_KEYWORDS.some(kw => cell.includes(kw))
     ).length;
 
-    // Must have at least 2 bank header keywords to be considered the header
     if (matchCount >= 2) {
       return i;
     }
   }
-  return 0; // Default to first row if no clear header found
+  return 0;
 }
 
 /**
- * Intelligently suggest column indices from the detected header row.
+ * Detect Statement Format Template
+ */
+export function detectStatementFormat(headers) {
+  const norm = headers.map(h => (h || '').toLowerCase().trim());
+  const headerStr = norm.join('|');
+
+  // Format 1: UPI Unified Statement (BHIM / Bank Export)
+  // Date, Time, Bank Name, Account Number, Sender, Receiver, Payment ID/Reference Number, Pay/Collect, Amount (in Rs.), DR/CR, Status
+  if (
+    norm.includes('sender') &&
+    norm.includes('receiver') &&
+    (headerStr.includes('dr/cr') || norm.includes('dr/cr'))
+  ) {
+    return {
+      formatId: 'upi_unified',
+      formatName: 'UPI Unified Statement (BHIM / Bank Export)',
+      isRecognized: true,
+      mapping: {
+        dateCol: norm.findIndex(h => h === 'date'),
+        timeCol: norm.findIndex(h => h === 'time'),
+        bankCol: norm.findIndex(h => h.includes('bank')),
+        accountCol: norm.findIndex(h => h.includes('account')),
+        senderCol: norm.findIndex(h => h === 'sender'),
+        receiverCol: norm.findIndex(h => h === 'receiver'),
+        refCol: norm.findIndex(h => h.includes('payment id') || h.includes('reference')),
+        payCollectCol: norm.findIndex(h => h.includes('pay/collect') || h === 'pay/collect'),
+        amountCol: norm.findIndex(h => h.includes('amount')),
+        typeCol: norm.findIndex(h => h.includes('dr/cr') || h === 'dr/cr'),
+        statusCol: norm.findIndex(h => h === 'status'),
+        dateFormat: 'dmy',
+      },
+    };
+  }
+
+  // Format 2: Google Pay Statement
+  if (
+    (headerStr.includes('google transaction id') || headerStr.includes('gpay')) ||
+    (norm.includes('to / from') || (norm.includes('description') && norm.includes('transaction id') && norm.includes('amount') && norm.includes('status')))
+  ) {
+    return {
+      formatId: 'google_pay',
+      formatName: 'Google Pay UPI Statement',
+      isRecognized: true,
+      mapping: {
+        dateCol: norm.findIndex(h => h.includes('date')),
+        timeCol: norm.findIndex(h => h.includes('time')),
+        descCol: norm.findIndex(h => h.includes('description') || h.includes('to / from') || h.includes('details')),
+        refCol: norm.findIndex(h => h.includes('transaction id') || h.includes('google transaction id') || h.includes('ref')),
+        amountCol: norm.findIndex(h => h.includes('amount')),
+        statusCol: norm.findIndex(h => h.includes('status')),
+        dateFormat: 'auto',
+      },
+    };
+  }
+
+  // Format 3: PhonePe Statement
+  if (
+    norm.includes('transaction with') ||
+    (norm.includes('transaction id') && norm.includes('details') && (norm.includes('type') || norm.includes('amount')))
+  ) {
+    return {
+      formatId: 'phonepe',
+      formatName: 'PhonePe Statement',
+      isRecognized: true,
+      mapping: {
+        dateCol: norm.findIndex(h => h.includes('date')),
+        descCol: norm.findIndex(h => h.includes('transaction with') || h.includes('details') || h.includes('description')),
+        refCol: norm.findIndex(h => h.includes('transaction id') || h.includes('utr') || h.includes('reference')),
+        typeCol: norm.findIndex(h => h === 'type' || h.includes('type')),
+        amountCol: norm.findIndex(h => h.includes('amount')),
+        statusCol: norm.findIndex(h => h.includes('status')),
+        dateFormat: 'auto',
+      },
+    };
+  }
+
+  // Format 4: Paytm Statement
+  if (
+    norm.includes('wallet txn id') ||
+    (norm.includes('activity') && norm.includes('source/destination'))
+  ) {
+    return {
+      formatId: 'paytm',
+      formatName: 'Paytm Statement',
+      isRecognized: true,
+      mapping: {
+        dateCol: norm.findIndex(h => h.includes('date')),
+        timeCol: norm.findIndex(h => h.includes('time')),
+        descCol: norm.findIndex(h => h.includes('activity') || h.includes('source/destination') || h.includes('comment')),
+        refCol: norm.findIndex(h => h.includes('wallet txn id') || h.includes('order id') || h.includes('txn id')),
+        amountCol: norm.findIndex(h => h.includes('amount') || h.includes('transaction breakup')),
+        statusCol: norm.findIndex(h => h.includes('status')),
+        dateFormat: 'auto',
+      },
+    };
+  }
+
+  // Format 5: Standard Bank Account CSV (HDFC, SBI, ICICI, Axis, Kotak, Generic)
+  const hasDebit = norm.some(h => h.includes('debit') || h.includes('withdrawal') || h === 'dr');
+  const hasCredit = norm.some(h => h.includes('credit') || h.includes('deposit') || h === 'cr');
+  if (hasDebit || hasCredit) {
+    return {
+      formatId: 'bank_statement',
+      formatName: 'Bank Account Statement (Debit/Credit Ledger)',
+      isRecognized: true,
+      mapping: {
+        dateCol: norm.findIndex(h => h.includes('date') && !h.includes('update')),
+        descCol: norm.findIndex(h => h.includes('narration') || h.includes('description') || h.includes('particulars') || h.includes('remarks')),
+        refCol: norm.findIndex(h => h.includes('ref') || h.includes('chq') || h.includes('utr')),
+        debitCol: norm.findIndex(h => (h.includes('debit') || h.includes('withdrawal') || h === 'dr') && !h.includes('total')),
+        creditCol: norm.findIndex(h => (h.includes('credit') || h.includes('deposit') || h === 'cr') && !h.includes('total')),
+        dateFormat: 'auto',
+      },
+    };
+  }
+
+  // Generic Fallback
+  return {
+    formatId: 'generic',
+    formatName: 'Generic Bank CSV',
+    isRecognized: false,
+    mapping: guessColumnMapping(headers),
+  };
+}
+
+/**
+ * Column mapping guesser for unstructured or arbitrary CSVs
  */
 export function guessColumnMapping(headers) {
   const mapping = {
@@ -126,69 +242,36 @@ export function guessColumnMapping(headers) {
     creditCol: -1,
     typeCol: -1,
     refCol: -1,
+    statusCol: -1,
     dateFormat: 'auto',
   };
 
-  const normalized = headers.map(h => (h || '').toLowerCase().trim());
+  const norm = headers.map(h => (h || '').toLowerCase().trim());
 
-  normalized.forEach((h, idx) => {
-    // Date column
-    if (mapping.dateCol === -1) {
-      if (h === 'date' || h === 'txn date' || h === 'transaction date' || h === 'value date') {
-        mapping.dateCol = idx;
-      } else if (h.includes('date') && !h.includes('update')) {
-        mapping.dateCol = idx;
-      }
+  norm.forEach((h, idx) => {
+    if (mapping.dateCol === -1 && (h === 'date' || h === 'txn date' || h === 'transaction date' || (h.includes('date') && !h.includes('update')))) {
+      mapping.dateCol = idx;
     }
-
-    // Debit column
-    if (mapping.debitCol === -1) {
-      if (h === 'debit' || h === 'withdrawal' || h === 'dr' || h === 'debit amount' || h === 'withdrawals') {
-        mapping.debitCol = idx;
-      } else if ((h.includes('debit') || h.includes('withdrawal')) && !h.includes('total')) {
-        mapping.debitCol = idx;
-      }
+    if (mapping.debitCol === -1 && (h === 'debit' || h === 'withdrawal' || h === 'dr' || h === 'debit amount' || h.includes('withdrawal'))) {
+      mapping.debitCol = idx;
     }
-
-    // Credit column
-    if (mapping.creditCol === -1) {
-      if (h === 'credit' || h === 'deposit' || h === 'cr' || h === 'credit amount' || h === 'deposits') {
-        mapping.creditCol = idx;
-      } else if ((h.includes('credit') || h.includes('deposit')) && !h.includes('total')) {
-        mapping.creditCol = idx;
-      }
+    if (mapping.creditCol === -1 && (h === 'credit' || h === 'deposit' || h === 'cr' || h === 'credit amount' || h.includes('deposit'))) {
+      mapping.creditCol = idx;
     }
-
-    // Single Amount column
-    if (mapping.amountCol === -1) {
-      if (h === 'amount' || h === 'txn amount' || h === 'transaction amount') {
-        mapping.amountCol = idx;
-      }
+    if (mapping.amountCol === -1 && (h === 'amount' || h === 'amount (in rs.)' || h === 'txn amount' || h === 'transaction amount')) {
+      mapping.amountCol = idx;
     }
-
-    // Type column (DR / CR)
-    if (mapping.typeCol === -1) {
-      if (h === 'type' || h === 'cr/dr' || h === 'dr/cr' || h === 'txn type' || h === 'transaction type') {
-        mapping.typeCol = idx;
-      }
+    if (mapping.typeCol === -1 && (h === 'type' || h === 'dr/cr' || h === 'cr/dr' || h === 'pay/collect')) {
+      mapping.typeCol = idx;
     }
-
-    // Description / Narration
-    if (mapping.descCol === -1) {
-      if (h === 'narration' || h === 'description' || h === 'particulars' || h === 'remarks') {
-        mapping.descCol = idx;
-      } else if (h.includes('description') || h.includes('narration') || h.includes('particulars') || h.includes('details') || h.includes('payee')) {
-        mapping.descCol = idx;
-      }
+    if (mapping.descCol === -1 && (h === 'narration' || h === 'description' || h === 'particulars' || h === 'receiver' || h === 'remarks' || h.includes('details'))) {
+      mapping.descCol = idx;
     }
-
-    // Reference / UTR
-    if (mapping.refCol === -1) {
-      if (h === 'chq/ref no' || h === 'ref no' || h === 'reference' || h === 'utr' || h === 'chq no' || h === 'txn id') {
-        mapping.refCol = idx;
-      } else if (h.includes('ref') || h.includes('utr') || h.includes('cheque') || h.includes('chq')) {
-        mapping.refCol = idx;
-      }
+    if (mapping.refCol === -1 && (h.includes('payment id') || h.includes('reference') || h.includes('utr') || h.includes('chq') || h.includes('txn id'))) {
+      mapping.refCol = idx;
+    }
+    if (mapping.statusCol === -1 && h === 'status') {
+      mapping.statusCol = idx;
     }
   });
 
@@ -196,16 +279,66 @@ export function guessColumnMapping(headers) {
 }
 
 /**
- * Cleans numerical amount string (removes ₹, Rs., INR, commas, whitespace)
+ * Clean UPI entity string: extracts readable human/merchant name from `vpa(NAME)` or VPA handle.
+ * Masks sensitive mobile numbers where applicable.
+ */
+export function cleanUpiEntity(raw) {
+  if (!raw) return 'Unknown Party';
+  const str = String(raw).trim();
+
+  // 1. Check parenthesized name, e.g. "user@ybl(NAME)" -> "NAME"
+  const parenMatch = str.match(/\(([^)]+)\)/);
+  if (parenMatch && parenMatch[1].trim()) {
+    const inside = parenMatch[1].trim();
+    if (!/^x+$/i.test(inside.replace(/[^a-zA-Z0-9]/g, ''))) {
+      return inside;
+    }
+  }
+
+  // 2. Check handle before @, e.g. "swiggy@icici" -> "Swiggy"
+  const atMatch = str.match(/^([^@()]+)@/);
+  if (atMatch && atMatch[1].trim()) {
+    const handle = atMatch[1].trim();
+    if (!/^x+$/i.test(handle.replace(/[^a-zA-Z0-9]/g, '')) && !/^\d{10}$/.test(handle)) {
+      return handle.charAt(0).toUpperCase() + handle.slice(1);
+    }
+  }
+
+  if (parenMatch && parenMatch[1].trim()) return parenMatch[1].trim();
+  return str.split('@')[0] || str;
+}
+
+/**
+ * Checks if status indicates successful completion.
+ * Rejects failed, declined, cancelled, or pending transactions.
+ */
+export function isSuccessfulStatus(statusRaw) {
+  if (!statusRaw || typeof statusRaw !== 'string' || statusRaw.trim().length === 0) return false;
+  const s = statusRaw.trim().toUpperCase();
+  if (s === 'SUCCESS' || s === 'SUCCESSFUL' || s === 'COMPLETED' || s === 'PAID' || s === 'DONE' || s === 'EXECUTED' || s === 'PROCESSED' || s === 'CLEARED') {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Detects whether a transaction is a refund or reversal.
+ */
+export function isRefundOrReversal(text) {
+  if (!text || typeof text !== 'string') return false;
+  const str = text.toLowerCase();
+  return /\b(refund|reversal|reversed|chargeback|return of|dispute credit|rfd)\b/i.test(str);
+}
+
+/**
+ * Cleans numerical amount string (removes currency symbols, commas, whitespace)
  */
 export function cleanAmount(val) {
   if (val === null || val === undefined) return null;
   let str = String(val).trim();
   if (!str || str === '-' || str === '--') return null;
 
-  // Remove currency codes and symbols
   str = str.replace(/(₹|Rs\.?|INR|\$|€|£)/gi, '').trim();
-  // Remove commas
   str = str.replace(/,/g, '');
 
   let isNegative = false;
@@ -214,7 +347,6 @@ export function cleanAmount(val) {
     str = str.replace(/-/g, '');
   }
 
-  // Check for trailing Dr/Cr in amount
   let suffixType = null;
   if (/dr$/i.test(str)) {
     suffixType = 'debit';
@@ -234,9 +366,6 @@ export function cleanAmount(val) {
   };
 }
 
-/**
- * Month lookup for named month parsing
- */
 const MONTH_NAMES = {
   jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
   jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
@@ -244,20 +373,12 @@ const MONTH_NAMES = {
   july: 7, august: 8, september: 9, october: 10, november: 11, december: 12
 };
 
-/**
- * Parses diverse date string formats into standard YYYY-MM-DD.
- * Formats handled:
- * - DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
- * - YYYY-MM-DD, YYYY/MM/DD
- * - MM/DD/YYYY, MM-DD-YYYY
- * - DD Mon YYYY, DD-Mon-YYYY (e.g. 24 Mar 2026, 24-MAR-2026)
- */
 export function parseDateString(raw, formatHint = 'auto') {
   if (!raw || typeof raw !== 'string') return null;
   const str = raw.trim();
   if (!str) return null;
 
-  // 1. ISO format: YYYY-MM-DD
+  // ISO: YYYY-MM-DD
   const isoMatch = str.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T\s].*)?$/);
   if (isoMatch) {
     const y = parseInt(isoMatch[1], 10);
@@ -266,7 +387,7 @@ export function parseDateString(raw, formatHint = 'auto') {
     if (isValidDate(y, m, d)) return formatDate(y, m, d);
   }
 
-  // 2. Alpha month: 24-Mar-2026 or 24 Mar 2026 or 24-MAR-26
+  // Alpha month: 24-Mar-2026 or 24 Mar 2026
   const alphaMatch = str.match(/^(\d{1,2})[-/\s]([A-Za-z]{3,9})[-/\s](\d{2,4})(?:[T\s].*)?$/);
   if (alphaMatch) {
     const d = parseInt(alphaMatch[1], 10);
@@ -277,7 +398,7 @@ export function parseDateString(raw, formatHint = 'auto') {
     if (m && isValidDate(y, m, d)) return formatDate(y, m, d);
   }
 
-  // 3. Delimited numeric: DD/MM/YYYY or MM/DD/YYYY
+  // Delimited: DD/MM/YYYY or MM/DD/YYYY
   const numMatch = str.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})(?:[T\s].*)?$/);
   if (numMatch) {
     const first = parseInt(numMatch[1], 10);
@@ -285,24 +406,19 @@ export function parseDateString(raw, formatHint = 'auto') {
     let y = parseInt(numMatch[3], 10);
     if (y < 100) y += 2000;
 
-    // Check hint
     if (formatHint === 'mdy') {
       if (isValidDate(y, first, second)) return formatDate(y, first, second);
     } else if (formatHint === 'dmy') {
       if (isValidDate(y, second, first)) return formatDate(y, second, first);
     }
 
-    // Auto heuristics:
-    // If first > 12, it must be DD/MM/YYYY
     if (first > 12 && second <= 12) {
       if (isValidDate(y, second, first)) return formatDate(y, second, first);
     }
-    // If second > 12, it must be MM/DD/YYYY
     if (second > 12 && first <= 12) {
       if (isValidDate(y, first, second)) return formatDate(y, first, second);
     }
 
-    // Default for Indian & global banking is DD/MM/YYYY
     if (isValidDate(y, second, first)) {
       return formatDate(y, second, first);
     }
@@ -327,96 +443,220 @@ function formatDate(y, m, d) {
 }
 
 /**
- * Extracts reference/UTR and cleans merchant name from raw description and reference cells.
+ * Category Keyword Dictionaries
  */
-export function extractMerchantAndRef(rawDesc, rawRef) {
-  let merchant = (rawDesc || '').trim();
-  let reference = (rawRef || '').trim() || null;
+const CATEGORY_KEYWORDS = {
+  expense: [
+    {
+      category: 'Food',
+      keywords: [
+        'swiggy', 'zomato', 'restaurant', 'cafe', 'dining', 'kitchen', 'bites',
+        'bakery', 'starbucks', 'tea', 'chai', 'coffee', 'pizza', 'burger',
+        'mcdonald', 'kfc', 'blinkit', 'zepto', 'instamart', 'bigbasket',
+        'grocer', 'supermarket', 'meat', 'chicken', 'hotel', 'dhaba', 'tiffin',
+        'canteen', 'eats', 'food', 'snack', 'dosa', 'biryani', 'sweets', 'juice'
+      ]
+    },
+    {
+      category: 'Travel',
+      keywords: [
+        'uber', 'ola', 'rapido', 'metro', 'irctc', 'train', 'bus', 'railway',
+        'flight', 'indigo', 'airasia', 'redbus', 'makemytrip', 'petrol', 'fuel',
+        'diesel', 'indianoil', 'hpcl', 'bpcl', 'shell', 'toll', 'fastag',
+        'auto', 'cab', 'driver', 'transport', 'parking', 'airlines'
+      ]
+    },
+    {
+      category: 'Shopping',
+      keywords: [
+        'amazon', 'flipkart', 'myntra', 'ajio', 'meesho', 'nykaa', 'croma',
+        'reliance', 'retail', 'fashion', 'clothes', 'store', 'mall', 'mart',
+        'cloth', 'jewel', 'footwear', 'zudio', 'decathlon', 'lenskart',
+        'shopping', 'bazaar', 'textiles', 'trends'
+      ]
+    },
+    {
+      category: 'Bills',
+      keywords: [
+        'bill', 'electricity', 'bescom', 'water', 'gas', 'recharge', 'airtel',
+        'jio', 'vi', 'vodafone', 'broadband', 'wifi', 'dth', 'tataplay',
+        'postpaid', 'prepaid', 'credit card', 'emi', 'loan', 'insurance', 'lic'
+      ]
+    },
+    {
+      category: 'Entertainment',
+      keywords: [
+        'netflix', 'spotify', 'hotstar', 'prime video', 'youtube', 'cinema',
+        'pvr', 'inox', 'movie', 'playstation', 'steam', 'game', 'gaming',
+        'ticket', 'bookmyshow', 'music'
+      ]
+    },
+    {
+      category: 'Healthcare',
+      keywords: [
+        'health', 'medical', 'pharmacy', 'chemist', 'apollo', 'medplus',
+        '1mg', 'pharma', 'hospital', 'clinic', 'doctor', 'dental', 'diagnostic',
+        'lab', 'pathology', 'medicals', 'opticals'
+      ]
+    },
+    {
+      category: 'Education',
+      keywords: [
+        'education', 'school', 'college', 'university', 'tuition', 'coaching',
+        'class', 'course', 'udemy', 'coursera', 'books', 'stationary', 'fee', 'academy'
+      ]
+    },
+    {
+      category: 'Utilities',
+      keywords: [
+        'utility', 'utilities', 'maintenance', 'repair', 'cleaning', 'plumber',
+        'electrician', 'service'
+      ]
+    }
+  ],
+  income: [
+    {
+      category: 'Salary',
+      keywords: [
+        'salary', 'payroll', 'stipend', 'wages', 'remuneration', 'infosys',
+        'tcs', 'wipro', 'accenture', 'cognizant', 'hcl', 'tech mahindra',
+        'google', 'microsoft', 'amazon', 'corp', 'limited', 'pvt ltd'
+      ]
+    },
+    {
+      category: 'Freelance',
+      keywords: ['freelance', 'upwork', 'fiverr', 'toptal', 'contract', 'consulting', 'gig']
+    },
+    {
+      category: 'Investment',
+      keywords: [
+        'investment', 'zerodha', 'groww', 'upstox', 'angel', 'kuvera',
+        'mutual fund', 'sip', 'nse', 'bse', 'equity', 'shares', 'crypto'
+      ]
+    },
+    {
+      category: 'Dividends',
+      keywords: ['dividend', 'interest', 'fd', 'rd', 'yield']
+    },
+    {
+      category: 'Rental',
+      keywords: ['rent', 'rental', 'tenant', 'lease']
+    },
+    {
+      category: 'Bonus',
+      keywords: ['bonus', 'reward', 'cashback', 'incentive']
+    },
+    {
+      category: 'Business',
+      keywords: ['business', 'sales', 'vendor', 'customer', 'client', 'invoice']
+    }
+  ]
+};
 
-  // Clean obvious noise
-  merchant = merchant.replace(/\s+/g, ' ');
+/**
+ * Auto-categorization engine with refund protection.
+ * If transaction is a refund/reversal, returns 'Refunds & Reversals' expense category.
+ */
+export function autoCategorize(text, direction, dbCategories, isRefund = false) {
+  // If flagged as refund or reversal, map strictly to Refunds & Reversals under expense
+  if (isRefund) {
+    const refundCat = dbCategories.find(c =>
+      c.category_type === 'expense' && c.category_name.toLowerCase().includes('refund')
+    ) || dbCategories.find(c =>
+      c.category_type === 'expense' && c.category_name.toLowerCase().includes('other expense')
+    ) || dbCategories.find(c => c.category_type === 'expense');
 
-  // Look for 12-digit numeric UPI reference / UTR if no reference is present
-  if (!reference) {
-    const upiRefMatch = merchant.match(/(?:UPI|UTR|REF|TXN)[:\s\-/]*([0-9]{10,18})/i)
-      || merchant.match(/\b([0-9]{12})\b/);
-    if (upiRefMatch) {
-      reference = upiRefMatch[1];
+    return {
+      categoryId: refundCat?.category_id || null,
+      categoryName: refundCat?.category_name || 'Refunds & Reversals',
+      matchedKeyword: 'refund',
+    };
+  }
+
+  const normText = (text || '').toLowerCase();
+  const type = direction === 'debit' ? 'expense' : 'income';
+  const rules = CATEGORY_KEYWORDS[type] || [];
+
+  for (const rule of rules) {
+    for (const kw of rule.keywords) {
+      if (normText.includes(kw)) {
+        const matchedDbCat = dbCategories.find(c =>
+          c.category_type === type && c.category_name.toLowerCase() === rule.category.toLowerCase()
+        );
+        if (matchedDbCat) {
+          return {
+            categoryId: matchedDbCat.category_id,
+            categoryName: matchedDbCat.category_name,
+            matchedKeyword: kw,
+          };
+        }
+      }
     }
   }
 
-  // Generate a cleaner merchant display name if prefixed with bank codes
-  let cleanMerchant = merchant;
-  // e.g. "UPI/DR/123456789012/SWIGGY/ICICI" -> "SWIGGY"
-  const upiParts = cleanMerchant.split(/[/\\-]/).map(p => p.trim()).filter(Boolean);
-  if (upiParts.length >= 3 && /^upi$/i.test(upiParts[0])) {
-    const namedPart = upiParts.find((p, idx) =>
-      idx > 0 && !/^\d+$/.test(p) && !/^(dr|cr|p2p|p2m|pay|payment)$/i.test(p) && p.length > 2
-    );
-    if (namedPart) {
-      cleanMerchant = namedPart;
-    }
-  }
-
-  // e.g. "POS 401234XXXXXX1234 STARBUCKS"
-  cleanMerchant = cleanMerchant.replace(/^POS\s+\d+X+\d+\s+/i, '');
-  // e.g. "NEFT/AXIS12345/..."
-  cleanMerchant = cleanMerchant.replace(/^(NEFT|IMPS|RTGS|ACH|NACH|ATM-WDL|CASH-WDL)[/\s:]+/i, '');
-
-  cleanMerchant = cleanMerchant.trim();
-  if (!cleanMerchant || cleanMerchant.length < 2) {
-    cleanMerchant = merchant || 'Bank Statement Transaction';
-  }
+  const fallbackName = type === 'expense' ? 'other expense' : 'other income';
+  const fallbackCat = dbCategories.find(c =>
+    c.category_type === type && c.category_name.toLowerCase() === fallbackName
+  ) || dbCategories.find(c => c.category_type === type);
 
   return {
-    merchant: cleanMerchant.slice(0, 180),
-    rawDescription: merchant.slice(0, 240),
-    reference: reference ? reference.slice(0, 150) : null,
+    categoryId: fallbackCat?.category_id || null,
+    categoryName: fallbackCat?.category_name || (type === 'expense' ? 'Other Expense' : 'Other Income'),
+    matchedKeyword: null,
   };
 }
 
 /**
- * Parse and validate bank statement rows with explicit per-row validation reporting.
+ * Universal Statement Parser & Normalizer
+ * Handles automated ingestion, refund detection, deduplication, and error reporting.
  */
-export function parseStatementRows(rawRows, mapping, options = {}) {
-  const { userId, existingFingerprints = new Set() } = options;
-  const headerIdx = findHeaderRowIndex(rawRows);
-  const headers = rawRows[headerIdx] || [];
-  const activeMapping = { ...guessColumnMapping(headers), ...mapping };
+export function parseAndNormalizeStatement(csvText, options = {}) {
+  const { userId, categories = [], existingFingerprints = new Set(), customMapping = null } = options;
 
-  const validRows = [];
+  const delimiter = detectDelimiter(csvText);
+  const rows = parseCSV(csvText, delimiter);
+  if (rows.length === 0) {
+    throw new Error('CSV statement file contains no readable data.');
+  }
+
+  const headerIdx = findHeaderRowIndex(rows);
+  const headers = rows[headerIdx] || [];
+  const formatInfo = detectStatementFormat(headers);
+  const activeMapping = customMapping || formatInfo.mapping;
+
+  const successfulRows = [];
+  const duplicateRows = [];
+  const skippedFailedRows = [];
   const invalidRows = [];
   const seenBatchFingerprints = new Set();
 
-  for (let idx = headerIdx + 1; idx < rawRows.length; idx++) {
-    const row = rawRows[idx];
+  for (let idx = headerIdx + 1; idx < rows.length; idx++) {
+    const row = rows[idx];
     const rowNumber = idx + 1;
 
-    // Skip empty rows
-    if (!row || row.every(cell => !cell || cell.trim().length === 0)) {
+    if (!row || row.every(c => !c || c.trim().length === 0)) {
       continue;
     }
 
-    // 1. Date
-    const rawDate = activeMapping.dateCol >= 0 ? row[activeMapping.dateCol] : '';
-    const parsedDate = parseDateString(rawDate, activeMapping.dateFormat);
+    // 1. Structural Validation: Date parsing
+    const rawDate = activeMapping.dateCol >= 0 && activeMapping.dateCol < row.length ? row[activeMapping.dateCol] : '';
+    const parsedDate = parseDateString(rawDate, activeMapping.dateFormat || 'auto');
     if (!parsedDate) {
       invalidRows.push({
         rowNumber,
-        reason: `Invalid or missing transaction date ('${rawDate || 'empty'}'). Expected DD/MM/YYYY or YYYY-MM-DD.`,
+        reason: `Invalid transaction date ('${rawDate || 'empty'}'). Expected DD/MM/YYYY or YYYY-MM-DD.`,
         rawData: row,
       });
       continue;
     }
 
-    // 2. Amount and Direction (Debit/Credit)
+    // 2. Structural Validation: Direction and Amount
     let amount = null;
     let direction = null;
 
+    // A. Separate Debit / Credit columns
     const hasDebitCol = activeMapping.debitCol >= 0 && activeMapping.debitCol < row.length;
     const hasCreditCol = activeMapping.creditCol >= 0 && activeMapping.creditCol < row.length;
-    const hasAmountCol = activeMapping.amountCol >= 0 && activeMapping.amountCol < row.length;
-
     if (hasDebitCol || hasCreditCol) {
       const debitParsed = hasDebitCol ? cleanAmount(row[activeMapping.debitCol]) : null;
       const creditParsed = hasCreditCol ? cleanAmount(row[activeMapping.creditCol]) : null;
@@ -430,31 +670,23 @@ export function parseStatementRows(rawRows, mapping, options = {}) {
       }
     }
 
-    // Single amount column with Type or negative sign
-    if (amount === null && hasAmountCol) {
+    // B. Amount with DR/CR or Type column
+    if (amount === null && activeMapping.amountCol >= 0 && activeMapping.amountCol < row.length) {
       const amtParsed = cleanAmount(row[activeMapping.amountCol]);
       if (amtParsed && amtParsed.value > 0) {
         amount = amtParsed.value;
 
-        // Check Type column
         if (activeMapping.typeCol >= 0 && activeMapping.typeCol < row.length) {
-          const typeVal = (row[activeMapping.typeCol] || '').toLowerCase().trim();
-          if (typeVal.startsWith('dr') || typeVal.includes('debit') || typeVal.includes('withdraw') || typeVal === 'w') {
+          const typeVal = (row[activeMapping.typeCol] || '').trim().toUpperCase();
+          if (typeVal === 'DR' || typeVal.startsWith('DEBIT') || typeVal === 'W' || typeVal === 'PAY') {
             direction = 'debit';
-          } else if (typeVal.startsWith('cr') || typeVal.includes('credit') || typeVal.includes('deposit') || typeVal === 'd') {
+          } else if (typeVal === 'CR' || typeVal.startsWith('CREDIT') || typeVal === 'D' || typeVal === 'COLLECT') {
             direction = 'credit';
           }
         }
 
-        // Suffix in amount (e.g. 500 Dr)
-        if (!direction && amtParsed.suffixType) {
-          direction = amtParsed.suffixType;
-        }
-
-        // Negative sign in amount (e.g. -500.00 is debit)
-        if (!direction && amtParsed.isNegative) {
-          direction = 'debit';
-        }
+        if (!direction && amtParsed.suffixType) direction = amtParsed.suffixType;
+        if (!direction && amtParsed.isNegative) direction = 'debit';
       }
     }
 
@@ -476,40 +708,122 @@ export function parseStatementRows(rawRows, mapping, options = {}) {
       continue;
     }
 
-    // 3. Description & Reference
-    const rawDesc = activeMapping.descCol >= 0 ? row[activeMapping.descCol] : '';
-    const rawRef = activeMapping.refCol >= 0 ? row[activeMapping.refCol] : '';
-    const { merchant, rawDescription, reference } = extractMerchantAndRef(rawDesc, rawRef);
+    // 3. Status Check (Evaluated only for structurally valid rows)
+    if (activeMapping.statusCol >= 0) {
+      const rawStatus = activeMapping.statusCol < row.length ? row[activeMapping.statusCol] : '';
+      if (!isSuccessfulStatus(rawStatus)) {
+        const displayStatus = (rawStatus || '').trim() || 'MISSING';
+        skippedFailedRows.push({
+          rowNumber,
+          status: displayStatus,
+          reason: `Payment status is '${displayStatus}'. Missing or non-successful status entries are skipped when statement includes a status column.`,
+          rawData: row,
+        });
+        continue;
+      }
+    }
 
-    // 4. Deterministic SHA-256 Fingerprint
-    // Hash format: user|date|amount.toFixed(2)|direction|ref_or_merchant
-    const identityString = `${userId || 'web'}|${parsedDate}|${amount.toFixed(2)}|${direction}|${reference || merchant.toLowerCase()}`;
+    // 4. Counterparty & Narration Extraction
+    let counterparty = '';
+    let bankName = '';
+    let rawReference = '';
+    let fullContextText = '';
+
+    if (formatInfo.formatId === 'upi_unified') {
+      const sender = activeMapping.senderCol >= 0 ? row[activeMapping.senderCol] : '';
+      const receiver = activeMapping.receiverCol >= 0 ? row[activeMapping.receiverCol] : '';
+      bankName = activeMapping.bankCol >= 0 ? row[activeMapping.bankCol] : '';
+      rawReference = activeMapping.refCol >= 0 ? row[activeMapping.refCol] : '';
+      fullContextText = `${sender} ${receiver} ${row.join(' ')}`;
+
+      counterparty = direction === 'debit' ? cleanUpiEntity(receiver) : cleanUpiEntity(sender);
+    } else {
+      const rawDesc = activeMapping.descCol >= 0 ? row[activeMapping.descCol] : '';
+      rawReference = activeMapping.refCol >= 0 ? row[activeMapping.refCol] : '';
+      counterparty = cleanUpiEntity(rawDesc);
+      fullContextText = `${rawDesc} ${row.join(' ')}`;
+    }
+
+    // Reference / UTR
+    let reference = (rawReference || '').trim() || null;
+    if (!reference) {
+      const upiRefMatch = counterparty.match(/(?:UPI|UTR|REF|TXN)[:\s\-/]*([0-9]{10,18})/i)
+        || counterparty.match(/\b([0-9]{12})\b/);
+      if (upiRefMatch) reference = upiRefMatch[1];
+    }
+
+    // Check if this transaction is a refund or reversal
+    const isRefund = isRefundOrReversal(fullContextText);
+
+    const cleanMerchant = (counterparty || 'UPI Transaction').slice(0, 180);
+    const prefix = isRefund
+      ? '[Refund]'
+      : (direction === 'debit' ? 'Payment to' : 'Payment from');
+    const cleanDescription = `${prefix} ${cleanMerchant}${bankName ? ` (${bankName})` : ''}${reference ? ` - Ref: ${reference}` : ''}`.slice(0, 240);
+
+    // 5. Deterministic SHA-256 Fingerprint
+    const identityString = `${userId || 'web'}|${parsedDate}|${amount.toFixed(2)}|${direction}|${reference || cleanMerchant.toLowerCase()}`;
     const fingerprint = crypto.createHash('sha256').update(identityString).digest('hex');
 
-    // Check duplicate
+    // 6. Deduplication Check
     const isDuplicate = existingFingerprints.has(fingerprint) || seenBatchFingerprints.has(fingerprint);
     seenBatchFingerprints.add(fingerprint);
 
-    validRows.push({
+    // 7. Auto-Categorization (respecting refund flag)
+    const categoryResult = autoCategorize(`${cleanMerchant} ${cleanDescription}`, direction, categories, isRefund);
+
+    const transactionItem = {
       rowNumber,
       transactionDate: parsedDate,
       amount: Number(amount.toFixed(2)),
       currency: 'INR',
       direction, // 'debit' or 'credit'
-      merchant,
-      description: rawDescription,
+      isRefund,
+      merchant: cleanMerchant,
+      description: cleanDescription,
+      rawText: fullContextText,
       reference,
       fingerprint,
+      categoryId: categoryResult.categoryId,
+      categoryName: categoryResult.categoryName,
       isDuplicate,
-      status: isDuplicate ? 'duplicate' : 'pending',
-    });
+      status: isDuplicate ? 'duplicate' : 'approved',
+    };
+
+    if (isDuplicate) {
+      duplicateRows.push(transactionItem);
+    } else {
+      successfulRows.push(transactionItem);
+    }
   }
 
   return {
     headers,
     headerRowIndex: headerIdx,
+    formatId: formatInfo.formatId,
+    formatName: formatInfo.formatName,
+    isRecognized: formatInfo.isRecognized,
     mapping: activeMapping,
-    validRows,
+    totalRows: rows.length - headerIdx - 1,
+    successfulRows,
+    duplicateRows,
+    skippedFailedRows,
     invalidRows,
+  };
+}
+
+export function parseStatementRows(rawRows, mapping, options = {}) {
+  const dummyCsv = rawRows.map(r => r.join(',')).join('\n');
+  const res = parseAndNormalizeStatement(dummyCsv, {
+    userId: options.userId,
+    existingFingerprints: options.existingFingerprints,
+    customMapping: mapping,
+  });
+  return {
+    headers: res.headers,
+    headerRowIndex: res.headerRowIndex,
+    mapping: res.mapping,
+    validRows: [...res.successfulRows, ...res.duplicateRows],
+    invalidRows: [...res.invalidRows, ...res.skippedFailedRows],
   };
 }

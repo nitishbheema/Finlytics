@@ -11,7 +11,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "node server/server.js",
-    "test": "node scripts/test-api.js && node scripts/test-routes.js && node scripts/test-autotrack.js",
+    "test": "node scripts/test-api.js && node scripts/test-routes.js && node scripts/test-autotrack.js && node scripts/test-database-integration.js",
     "migrate": "node database/migrate.js"
   },
   "dependencies": {
